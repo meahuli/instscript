@@ -91,14 +91,17 @@ done
 #    Appended after the image's fixed --listen 0.0.0.0 --port 8188 --enable-cors-header.
 # ============================================================
 cat > "$ARGS_FILE" <<'EOF'
-# Managed by provision.sh — appended after the image's fixed --listen/--port/--cors.
---output-directory /dev/shm/output    # finished images -> RAM (wiped on pod stop)
---temp-directory /dev/shm/temp         # previews/intermediates -> RAM
---disable-metadata                     # don't embed prompt/workflow in saved PNGs (privacy)
-# Optional — uncomment as needed:
-# --listen 127.0.0.1                   # tunnel-only (overrides image's 0.0.0.0; reach via tunnel.ps1)
-# --preview-method auto                # live previews in the UI
-# --lowvram                            # only if you hit OOM; usually not needed on a 24GB L4
+# Managed by provision.sh. IMPORTANT: one flag per line, NO inline comments.
+# The image only strips whole-line '#' comments, so a trailing '# ...' on a flag
+# line would be passed to ComfyUI as garbage args and crash startup.
+# Outputs + previews go to RAM (wiped on pod stop); no metadata embedded in PNGs.
+--output-directory /dev/shm/output
+--temp-directory /dev/shm/temp
+--disable-metadata
+# Optional — uncomment (one flag per line, still no inline comments):
+# --listen 127.0.0.1
+# --preview-method auto
+# --lowvram
 EOF
 echo "==> wrote $ARGS_FILE"
 
