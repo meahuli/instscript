@@ -82,6 +82,8 @@ done
 #       bash /workspace/provision/dl-hidream.sh
 #       bash /workspace/provision/dl-qwen-image-2512.sh
 #       bash /workspace/provision/dl-qwen-edit-2511.sh
+#       bash /workspace/provision/dl-wan.sh            # video (Wan 2.2 14B fp8); MODE=i2v for image-to-video
+#       bash /workspace/provision/dl-ltx.sh            # video (LTX 13B fp8, fast); VARIANT=dev for quality
 #    Each is resumable and skips files already present. New models show up
 #    in ComfyUI after a model-list refresh (no pod restart needed for models).
 # ============================================================
