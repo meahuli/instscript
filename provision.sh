@@ -35,7 +35,8 @@ echo "==> venv: $VENV  ($(python --version 2>&1))"
 #    RunpodDirect) are skipped automatically if present.
 # ============================================================
 NODES=(
-  # none for now — add custom-node repo URLs here when you need them, e.g.:
+  "https://github.com/city96/ComfyUI-GGUF"            # load GGUF-quantized models + GGUF text encoders (QuadrupleCLIPLoaderGGUF etc.)
+  # add more when you need them, e.g.:
   # "https://github.com/Fannovel16/comfyui_controlnet_aux"
   # "https://github.com/Gourieff/ComfyUI-ReActor"
   # "https://github.com/balazik/ComfyUI-PuLID-Flux"   # Chroma/Flux PuLID
