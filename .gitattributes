@@ -1,0 +1,2 @@
+# Keep shell scripts LF so they run on Linux pods (avoids CRLF "bad interpreter").
+*.sh text eol=lf
