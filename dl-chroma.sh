@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================
-# Chroma (FLUX-based finetune) + FLUX encoders/VAE + PuLID model.
+# Chroma (FLUX-based finetune) + FLUX text encoders + VAE.
+# Runs on STOCK ComfyUI nodes (Load Diffusion Model + DualCLIPLoader + Load VAE)
+# — no custom nodes required.
 # Run:  bash /workspace/provision/dl-chroma.sh
 # Bump CHROMA_VERSION if a newer one is out on huggingface.co/lodestones/Chroma.
 # ============================================================
@@ -17,9 +19,9 @@ get "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl
 get "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors"            text_encoders clip_l.safetensors
 get "https://huggingface.co/camenduru/FLUX.1-dev-ungated/resolve/main/ae.safetensors"                     vae          ae.safetensors
 
-# PuLID-FLUX face-identity model.
-# NOTE: to USE this you also need the PuLID-Flux custom node — add it to
-# provision.sh NODES:  https://github.com/sipie800/ComfyUI-PuLID-Flux-Enhanced
-get "https://huggingface.co/guozinan/PuLID/resolve/main/pulid_flux_v0.9.1.safetensors" pulid pulid_flux_v0.9.1.safetensors
+# PuLID face-identity is intentionally LEFT OUT — it requires the PuLID-Flux
+# custom node. To enable it later: add the node to provision.sh NODES
+# (https://github.com/sipie800/ComfyUI-PuLID-Flux-Enhanced) and uncomment:
+# get "https://huggingface.co/guozinan/PuLID/resolve/main/pulid_flux_v0.9.1.safetensors" pulid pulid_flux_v0.9.1.safetensors
 
-echo "Chroma set ready in $MODELS_DIR"
+echo "Chroma set ready in $MODELS_DIR (stock nodes only)"
