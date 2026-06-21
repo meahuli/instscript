@@ -1,64 +1,68 @@
 #!/usr/bin/env bash
 # ============================================================
-# Sulphur-2 — UNCENSORED finetune of LTX-2.3 22B (SulphurAI/Sulphur-2-base).
-# A drop-in replacement for the LTX-2.3 diffusion checkpoint: reuses the same
-# Gemma encoder + distill LoRA + workflow, just swaps in the uncensored model.
+# LTX-2.3 22B (bf16) + Sulphur uncensoring — "base + LoRA" setup that works
+# for BOTH workflows, unmodified, via symlinks:
+#   - Sulphur:  ltx23_t2v base.json   (uncensored: base + Sulphur LoRA + distill)
+#   - Official: LTX-2.3_T2V_I2V_Single_Stage_Distilled_Full.json (base + distill)
 #
-# Files already on disk are SKIPPED (model-lib.sh's get() checks size first),
-# so if you already ran dl-ltx23.sh the encoder + LoRA are reused and only the
-# ~28 GB Sulphur checkpoint downloads. Re-runs are cheap / resumable.
+# Downloads ONE canonical set of files, then symlinks the name variants each
+# workflow expects (so no JSON editing). Uncensoring strength = the Sulphur
+# LoRA's strength in the UI (dial 0.5–1.0). Files already present are skipped;
+# symlinks are (re)created every run.
 #
-# Run:  bash /workspace/provision/dl-sulphur.sh              # default: fp8 (~28 GB, fits 32 GB)
-#       PRECISION=bf16 bash /workspace/provision/dl-sulphur.sh    # bf16 (44 GB, 48 GB+)
-#
-# Needs custom nodes ComfyUI-LTXVideo + RES4LYF (in provision.sh NODES).
+# Run:  bash /workspace/provision/dl-sulphur.sh
+# ~85 GB (bf16) — fits a 48 GB+ pod. Needs nodes ComfyUI-LTXVideo + RES4LYF.
 # ============================================================
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/model-lib.sh"
 
-PRECISION="${PRECISION:-bf16}"
-case "$PRECISION" in
-  fp8)  CKPT="sulphur_dev_fp8mixed.safetensors" ;;   # ~28 GB, native fp8, fits 32 GB
-  bf16) CKPT="sulphur_dev_bf16.safetensors" ;;       # 44 GB, max fidelity, 48 GB+
-  *) echo "ERROR: PRECISION must be fp8 or bf16 (got '$PRECISION')"; exit 1 ;;
-esac
-S="https://huggingface.co/SulphurAI/Sulphur-2-base/resolve/main"
 LH="https://huggingface.co/Lightricks/LTX-2.3/resolve/main"
+S="https://huggingface.co/SulphurAI/Sulphur-2-base/resolve/main"
 CO="https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files"
 
-# 1) Uncensored Sulphur checkpoint (VAE bundled) -> checkpoints/
-get "$S/$CKPT" checkpoints "$CKPT"
+# symlink helper: link <relative-target> <subdir-under-models> <linkname>
+link() {
+  local target="$1" sub="$2" name="$3" dir="$MODELS_DIR/$2"
+  mkdir -p "$dir"
+  ln -sfn "$target" "$dir/$name" && echo "  link: $sub/$name -> $target"
+}
 
-# 2) Distill LoRA (fast few-step) -> loras/ltxv/ltx2/
-#    Sulphur's OWN distill LoRA — the one the author recommends pairing with the dev model.
-SDLORA="ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors"
-get "$S/distill_loras/$SDLORA" loras/ltxv/ltx2 "$SDLORA"
-#    (the generic LTX-2.3 distill LoRA also works, if you'd rather reuse dl-ltx23.sh's:)
-# get "$LH/ltx-2.3-22b-distilled-lora-384-1.1.safetensors" loras/ltxv/ltx2 ltx-2.3-22b-distilled-lora-384-1.1.safetensors
+# ---- Canonical real files (bf16; skipped if already on disk) ----
+get "$LH/ltx-2.3-22b-dev.safetensors"                 checkpoints   ltx-2.3-22b-dev.safetensors                  # base model (44 GB)
+get "$S/sulphur_lora_rank_768.safetensors"            loras         sulphur_lora_rank_768.safetensors            # Sulphur uncensoring LoRA (9.8 GB)
+get "$LH/ltx-2.3-22b-distilled-lora-384.safetensors"  loras         ltx-2.3-22b-distilled-lora-384.safetensors   # distill LoRA (7.3 GB)
+get "$CO/text_encoders/gemma_3_12B_it.safetensors"    text_encoders gemma_3_12B_it.safetensors                   # Gemma encoder bf16 (23 GB)
+#   To save ~17 GB (encoder precision doesn't affect output), use fp8 instead and
+#   the symlinks below still work — comment the line above and uncomment this:
+# get "$CO/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors" text_encoders gemma_3_12B_it.safetensors
+get "$LH/ltx-2.3-spatial-upscaler-x2-1.0.safetensors" checkpoints   ltx-2.3-spatial-upscaler-x2-1.0.safetensors  # hi-res upscaler (0.95 GB)
 
-# 3) Gemma-3-12B text encoder -> text_encoders/  (reused/skipped if already present)
-get "$CO/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors" text_encoders comfy_gemma_3_12B_it.safetensors
+# ---- Symlinks so BOTH workflows resolve their (differently-named) refs ----
+# Checkpoint: Sulphur workflow's "stock dev" slot is named *-fp8 -> point at the bf16 file
+link ltx-2.3-22b-dev.safetensors             checkpoints   ltx-2.3-22b-dev-fp8.safetensors
+# Sulphur LoRA placeholder name used in the workflow
+link sulphur_lora_rank_768.safetensors       loras         sulphur_final.safetensors
+# Distill-LoRA name variants -> the one real distill LoRA
+link ltx-2.3-22b-distilled-lora-384.safetensors loras      ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors
+link ../../ltx-2.3-22b-distilled-lora-384.safetensors loras/ltxv/ltx2 ltx-2.3-22b-distilled-lora-384-1.1.safetensors
+# Gemma encoder name variants -> the one real encoder
+link gemma_3_12B_it.safetensors              text_encoders comfy_gemma_3_12B_it.safetensors
+link gemma_3_12B_it.safetensors              text_encoders gemma_3_12B_it_fp4_mixed.safetensors
+# Upscaler also mirrored into upscale_models/ (in case the node looks there)
+link ../checkpoints/ltx-2.3-spatial-upscaler-x2-1.0.safetensors upscale_models ltx-2.3-spatial-upscaler-x2-1.0.safetensors
 
-# 4) Workflow JSON -> user/default/workflows/, patched to use the Sulphur checkpoint
-WF_NAME="LTX-2.3_T2V_I2V_Single_Stage_Distilled_Full.json"
-WF_DIR="$COMFY/user/default/workflows"
-mkdir -p "$WF_DIR"
-aria2c $ARIA_OPTS --dir="$WF_DIR" --out="$WF_NAME" \
-  "https://raw.githubusercontent.com/Lightricks/ComfyUI-LTXVideo/master/example_workflows/2.3/$WF_NAME" \
-  || echo "  (workflow JSON download failed — fetch it manually)"
-if [ -f "$WF_DIR/$WF_NAME" ]; then
-  sed -i -E "s/ltx-2\.3-22b-dev(-fp8)?\.safetensors/$CKPT/g" "$WF_DIR/$WF_NAME"
-  sed -i "s/ltx-2\.3-22b-distilled-lora-384-1\.1\.safetensors/$SDLORA/g" "$WF_DIR/$WF_NAME"
-  echo "==> patched workflow: checkpoint -> $CKPT, distill LoRA -> $SDLORA"
-fi
-
-# OPTIONAL: Sulphur uncensored prompt enhancer (local LLM that rewrites prompts; ~9-20 GB):
-# get "$S/prompt_enhancer_uncensored/prompt_enhancer_uncensored-q8_0.gguf" text_encoders prompt_enhancer_uncensored-q8_0.gguf
+# ---- Both workflow JSONs (unmodified — the symlinks make their refs resolve) ----
+WF_DIR="$COMFY/user/default/workflows"; mkdir -p "$WF_DIR"
+aria2c $ARIA_OPTS --dir="$WF_DIR" --out="LTX-2.3_T2V_I2V_Single_Stage_Distilled_Full.json" \
+  "https://raw.githubusercontent.com/Lightricks/ComfyUI-LTXVideo/master/example_workflows/2.3/LTX-2.3_T2V_I2V_Single_Stage_Distilled_Full.json" \
+  || echo "  (LTX official workflow JSON download failed)"
+aria2c $ARIA_OPTS --dir="$WF_DIR" --out="ltx23_t2v_base_sulphur.json" \
+  "https://huggingface.co/SulphurAI/Sulphur-2-base/resolve/main/workflows/ltx23_t2v%20base.json" \
+  || echo "  (Sulphur workflow JSON download failed)"
 
 echo ""
-echo "Sulphur-2 UNCENSORED LTX-2.3 ($PRECISION) ready in $MODELS_DIR"
-echo "Open the LTX-2.3 workflow (checkpoint now -> $CKPT). Needs ComfyUI-LTXVideo + RES4LYF."
-if [ "$PRECISION" = "bf16" ]; then
-  echo "bf16: 44 GB — needs 48 GB+ VRAM (or add '--fp8_e4m3fn-unet' to comfyui_args.txt on 32 GB)."
-else
-  echo "fp8: ~28 GB, native — fits 32 GB."
-fi
+echo "Done. Both workflows resolve via symlinks (no JSON editing):"
+echo "  Sulphur (uncensored):  ltx23_t2v_base_sulphur.json"
+echo "  Official (stock):      LTX-2.3_T2V_I2V_Single_Stage_Distilled_Full.json"
+echo "Uncensoring = the Sulphur LoRA (sulphur_final). Dial its strength (0.5-1.0) in the UI."
+echo "NOTE: taeltx2_3.safetensors (preview TAE) isn't published — if the LTX2SamplingPreviewOverride"
+echo "      node errors, bypass it (Ctrl+B); it only affects live preview, not the output."
