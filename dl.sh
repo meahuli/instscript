@@ -57,7 +57,7 @@ OUTARG=(); if [ -n "$OUT" ]; then OUTARG=(--out="$OUT"); fi
 echo "==> Downloading: $URL"
 if [ -n "$OUT" ]; then echo "    filename (from Content-Disposition): $OUT"; fi
 echo "    -> $(cd "$DEST" && pwd)"
-ARIA_OPTS="--continue=true --max-connection-per-server=8 --split=8 --min-split-size=8M --max-tries=5 --retry-wait=5 --auto-file-renaming=false --remote-time=true --content-disposition-default-utf8=true --console-log-level=warn --summary-interval=5"
+ARIA_OPTS="--continue=true --max-connection-per-server=16 --split=16 --min-split-size=8M --file-allocation=none --max-tries=5 --retry-wait=5 --auto-file-renaming=false --remote-time=true --content-disposition-default-utf8=true --console-log-level=warn --summary-interval=5"
 aria2c $ARIA_OPTS "${ARIA_AUTH[@]}" --dir="$DEST" "${OUTARG[@]}" "$URL"
 
 echo "==> Done. Saved in: $(cd "$DEST" && pwd)${OUT:+/$OUT}"

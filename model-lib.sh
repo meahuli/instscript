@@ -21,7 +21,7 @@ mkdir -p "$MODELS_DIR"/{diffusion_models,text_encoders,vae,loras,pulid,controlne
 
 command -v aria2c >/dev/null 2>&1 || { echo "==> installing aria2"; apt-get update -qq && apt-get install -y -qq aria2; }
 
-ARIA_OPTS="--continue=true --max-connection-per-server=8 --split=8 --allow-overwrite=true --auto-file-renaming=false --console-log-level=warn --summary-interval=5"
+ARIA_OPTS="--continue=true --max-connection-per-server=16 --split=16 --file-allocation=none --allow-overwrite=true --auto-file-renaming=false --console-log-level=warn --summary-interval=5"
 HF_AUTH=()
 [ -n "${HF_TOKEN:-}" ] && HF_AUTH=(--header="Authorization: Bearer $HF_TOKEN")
 
