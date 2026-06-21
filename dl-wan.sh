@@ -13,16 +13,22 @@
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/model-lib.sh"
 
 MODE="${MODE:-t2v}"
+PRECISION="${PRECISION:-bf16}"   # bf16 (= fp16 full, default) or fp8 (smaller/faster)
 case "$MODE" in t2v|i2v) ;; *) echo "ERROR: MODE must be t2v or i2v (got '$MODE')"; exit 1 ;; esac
+case "$PRECISION" in
+  bf16) DM="fp16";       ENC="umt5_xxl_fp16.safetensors" ;;             # Wan's full precision is fp16 (~27 GB/expert)
+  fp8)  DM="fp8_scaled"; ENC="umt5_xxl_fp8_e4m3fn_scaled.safetensors" ;;
+  *) echo "ERROR: PRECISION must be bf16 or fp8 (got '$PRECISION')"; exit 1 ;;
+esac
 
 WB="https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files"
 
 # 14B MoE: high-noise + low-noise experts (need both)
-get "$WB/diffusion_models/wan2.2_${MODE}_high_noise_14B_fp8_scaled.safetensors" diffusion_models "wan2.2_${MODE}_high_noise_14B_fp8_scaled.safetensors"
-get "$WB/diffusion_models/wan2.2_${MODE}_low_noise_14B_fp8_scaled.safetensors"  diffusion_models "wan2.2_${MODE}_low_noise_14B_fp8_scaled.safetensors"
+get "$WB/diffusion_models/wan2.2_${MODE}_high_noise_14B_${DM}.safetensors" diffusion_models "wan2.2_${MODE}_high_noise_14B_${DM}.safetensors"
+get "$WB/diffusion_models/wan2.2_${MODE}_low_noise_14B_${DM}.safetensors"  diffusion_models "wan2.2_${MODE}_low_noise_14B_${DM}.safetensors"
 
 # UMT5 text encoder (shared) + Wan 2.1 VAE (used by the 14B)
-get "$WB/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors" text_encoders umt5_xxl_fp8_e4m3fn_scaled.safetensors
+get "$WB/text_encoders/$ENC" text_encoders "$ENC"
 get "$WB/vae/wan_2.1_vae.safetensors"                          vae           wan_2.1_vae.safetensors
 
 # OPTIONAL: 4-step Lightning LoRAs (lightx2v) — ~5x faster gen. Uncomment the pair for your MODE.
@@ -41,4 +47,4 @@ get "$WB/vae/wan_2.1_vae.safetensors"                          vae           wan
 # UNCENSORED: base Wan is fairly permissive; for explicit content add an NSFW LoRA
 # (e.g. a Civitai "Wan 2.2 Remix NSFW" LoRA) into models/loras and load it in the workflow.
 
-echo "Wan 2.2 14B $MODE (fp8) ready in $MODELS_DIR"
+echo "Wan 2.2 14B $MODE ($PRECISION) ready in $MODELS_DIR"

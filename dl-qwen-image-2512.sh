@@ -7,7 +7,7 @@
 # ============================================================
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/model-lib.sh"
 
-VARIANT="${VARIANT:-fp8}"
+VARIANT="${VARIANT:-bf16}"
 case "$VARIANT" in
   fp8)  IMG="qwen_image_2512_fp8_e4m3fn.safetensors"; TENC="qwen_2.5_vl_7b_fp8_scaled.safetensors" ;;
   bf16) IMG="qwen_image_2512_bf16.safetensors";       TENC="qwen_2.5_vl_7b.safetensors" ;;

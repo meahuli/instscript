@@ -18,7 +18,7 @@
 # ============================================================
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/model-lib.sh"
 
-PRECISION="${PRECISION:-fp8}"
+PRECISION="${PRECISION:-bf16}"
 case "$PRECISION" in
   fp8)  CKPT="ltx-2.3-22b-dev-fp8.safetensors"
         CKPT_URL="https://huggingface.co/Lightricks/LTX-2.3-fp8/resolve/main/ltx-2.3-22b-dev-fp8.safetensors" ;;

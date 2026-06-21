@@ -11,12 +11,15 @@
 # ============================================================
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/model-lib.sh"
 
-VARIANT="${VARIANT:-distilled}"
-case "$VARIANT" in
-  distilled) MODEL="ltxv-13b-0.9.8-distilled-fp8.safetensors" ;;
-  dev)       MODEL="ltxv-13b-0.9.8-dev-fp8.safetensors" ;;
-  *) echo "ERROR: VARIANT must be distilled or dev (got '$VARIANT')"; exit 1 ;;
+VARIANT="${VARIANT:-distilled}"    # distilled (fast) or dev (max quality)
+PRECISION="${PRECISION:-bf16}"      # bf16 (full, default) or fp8 (smaller/faster)
+case "$VARIANT" in distilled|dev) ;; *) echo "ERROR: VARIANT must be distilled or dev (got '$VARIANT')"; exit 1 ;; esac
+case "$PRECISION" in
+  bf16) SUF="" ;;
+  fp8)  SUF="-fp8" ;;
+  *) echo "ERROR: PRECISION must be bf16 or fp8 (got '$PRECISION')"; exit 1 ;;
 esac
+MODEL="ltxv-13b-0.9.8-${VARIANT}${SUF}.safetensors"   # bf16 ~27 GB, fp8 ~half
 
 # LTXV all-in-one checkpoint (VAE is bundled inside) -> models/checkpoints/
 get "https://huggingface.co/Lightricks/LTX-Video/resolve/main/$MODEL" checkpoints "$MODEL"
@@ -34,4 +37,4 @@ get "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl
 # UNCENSORED: add an NSFW LoRA/merge (e.g. Civitai "Rebels Sulphur", or Phr00t LTX
 # merges) into models/loras and load it in the workflow.
 
-echo "LTX-Video 13B $VARIANT (fp8) ready — checkpoint in models/checkpoints/, T5 in models/text_encoders/"
+echo "LTX-Video 13B $VARIANT ($PRECISION) ready — checkpoint in models/checkpoints/, T5 in models/text_encoders/"

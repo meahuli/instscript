@@ -15,7 +15,7 @@
 # ============================================================
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/model-lib.sh"
 
-PRECISION="${PRECISION:-fp8}"
+PRECISION="${PRECISION:-bf16}"
 case "$PRECISION" in
   fp8)  CKPT="sulphur_dev_fp8mixed.safetensors" ;;   # ~28 GB, native fp8, fits 32 GB
   bf16) CKPT="sulphur_dev_bf16.safetensors" ;;       # 44 GB, max fidelity, 48 GB+
