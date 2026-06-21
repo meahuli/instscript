@@ -86,6 +86,8 @@ done
 #       bash /workspace/provision/dl-qwen-edit-2511.sh
 #       bash /workspace/provision/dl-wan.sh            # video (Wan 2.2 14B fp8); MODE=i2v for image-to-video
 #       bash /workspace/provision/dl-ltx.sh            # video (LTX 13B fp8, fast); VARIANT=dev for quality
+#       bash /workspace/provision/dl-ltx23.sh          # video (LTX-2.3 22B); PRECISION=bf16 for max quality
+#       bash /workspace/provision/dl-sulphur.sh        # video (UNCENSORED LTX-2.3 / Sulphur-2); PRECISION=bf16
 #    Each is resumable and skips files already present. New models show up
 #    in ComfyUI after a model-list refresh (no pod restart needed for models).
 # ============================================================
