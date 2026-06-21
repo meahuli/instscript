@@ -37,6 +37,7 @@ echo "==> venv: $VENV  ($(python --version 2>&1))"
 NODES=(
   "https://github.com/city96/ComfyUI-GGUF"            # load GGUF-quantized models + GGUF text encoders (QuadrupleCLIPLoaderGGUF etc.)
   "https://github.com/Lightricks/ComfyUI-LTXVideo"    # LTX-2.x video nodes (LTXAVTextEncoderLoader, LTXVAudioVAELoader, ...) — needed by dl-ltx23.sh
+  "https://github.com/ClownsharkBatwing/RES4LYF"      # advanced samplers/guiders (ClownSampler_Beta, MultimodalGuider, ManualSigmas) — needed by the LTX-2.3 workflow
   # add more when you need them, e.g.:
   # "https://github.com/Fannovel16/comfyui_controlnet_aux"
   # "https://github.com/Gourieff/ComfyUI-ReActor"
