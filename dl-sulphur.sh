@@ -34,7 +34,7 @@ get "$CO/text_encoders/gemma_3_12B_it.safetensors"    text_encoders gemma_3_12B_
 #   To save ~17 GB (encoder precision doesn't affect output), use fp8 instead and
 #   the symlinks below still work — comment the line above and uncomment this:
 # get "$CO/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors" text_encoders gemma_3_12B_it.safetensors
-get "$LH/ltx-2.3-spatial-upscaler-x2-1.0.safetensors" checkpoints   ltx-2.3-spatial-upscaler-x2-1.0.safetensors  # hi-res upscaler (0.95 GB)
+get "$LH/ltx-2.3-spatial-upscaler-x2-1.0.safetensors" latent_upscale_models ltx-2.3-spatial-upscaler-x2-1.0.safetensors  # spatial upscaler (0.95 GB) — node scans latent_upscale_models/
 get "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/vae/taeltx2_3.safetensors" vae taeltx2_3.safetensors   # preview TAE (22 MB, Kijai)
 
 # ---- Symlinks so BOTH workflows resolve their (differently-named) refs ----
@@ -48,8 +48,9 @@ link ../../ltx-2.3-22b-distilled-lora-384.safetensors loras/ltxv/ltx2 ltx-2.3-22
 # Gemma encoder name variants -> the one real encoder
 link gemma_3_12B_it.safetensors              text_encoders comfy_gemma_3_12B_it.safetensors
 link gemma_3_12B_it.safetensors              text_encoders gemma_3_12B_it_fp4_mixed.safetensors
-# Upscaler also mirrored into upscale_models/ (in case the node looks there)
-link ../checkpoints/ltx-2.3-spatial-upscaler-x2-1.0.safetensors upscale_models ltx-2.3-spatial-upscaler-x2-1.0.safetensors
+# Upscaler real file is in latent_upscale_models/; mirror into upscale_models/ + checkpoints/ as fallback
+link ../latent_upscale_models/ltx-2.3-spatial-upscaler-x2-1.0.safetensors upscale_models ltx-2.3-spatial-upscaler-x2-1.0.safetensors
+link ../latent_upscale_models/ltx-2.3-spatial-upscaler-x2-1.0.safetensors checkpoints   ltx-2.3-spatial-upscaler-x2-1.0.safetensors
 # Preview TAE mirrored into vae_approx/ (in case the preview node looks there)
 link ../vae/taeltx2_3.safetensors vae_approx taeltx2_3.safetensors
 
