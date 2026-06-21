@@ -28,11 +28,12 @@ CO="https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files"
 # 1) Uncensored Sulphur checkpoint (VAE bundled) -> checkpoints/
 get "$S/$CKPT" checkpoints "$CKPT"
 
-# 2) Distill LoRA (fast few-step) -> loras/ltxv/ltx2/  (LTX-2.3 generic; works on Sulphur).
-#    Reused/skipped if dl-ltx23.sh already fetched it.
-get "$LH/ltx-2.3-22b-distilled-lora-384-1.1.safetensors" loras/ltxv/ltx2 ltx-2.3-22b-distilled-lora-384-1.1.safetensors
-#    Sulphur's own cond-safe distill LoRA, if you prefer it tuned to Sulphur:
-# get "$S/distill_loras/ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors" loras/ltxv/ltx2 ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors
+# 2) Distill LoRA (fast few-step) -> loras/ltxv/ltx2/
+#    Sulphur's OWN distill LoRA — the one the author recommends pairing with the dev model.
+SDLORA="ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors"
+get "$S/distill_loras/$SDLORA" loras/ltxv/ltx2 "$SDLORA"
+#    (the generic LTX-2.3 distill LoRA also works, if you'd rather reuse dl-ltx23.sh's:)
+# get "$LH/ltx-2.3-22b-distilled-lora-384-1.1.safetensors" loras/ltxv/ltx2 ltx-2.3-22b-distilled-lora-384-1.1.safetensors
 
 # 3) Gemma-3-12B text encoder -> text_encoders/  (reused/skipped if already present)
 get "$CO/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors" text_encoders comfy_gemma_3_12B_it.safetensors
@@ -46,7 +47,8 @@ aria2c $ARIA_OPTS --dir="$WF_DIR" --out="$WF_NAME" \
   || echo "  (workflow JSON download failed — fetch it manually)"
 if [ -f "$WF_DIR/$WF_NAME" ]; then
   sed -i -E "s/ltx-2\.3-22b-dev(-fp8)?\.safetensors/$CKPT/g" "$WF_DIR/$WF_NAME"
-  echo "==> patched workflow checkpoint -> $CKPT"
+  sed -i "s/ltx-2\.3-22b-distilled-lora-384-1\.1\.safetensors/$SDLORA/g" "$WF_DIR/$WF_NAME"
+  echo "==> patched workflow: checkpoint -> $CKPT, distill LoRA -> $SDLORA"
 fi
 
 # OPTIONAL: Sulphur uncensored prompt enhancer (local LLM that rewrites prompts; ~9-20 GB):
