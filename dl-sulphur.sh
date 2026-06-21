@@ -26,10 +26,17 @@ link() {
   ln -sfn "$target" "$dir/$name" && echo "  link: $sub/$name -> $target"
 }
 
+# Self-heal: an older version of this script symlinked condsafe -> distill-384 (wrong file).
+# get()'s "-s" skip-check follows symlinks, so a stale link would mask the missing real file.
+# Remove it if (and only if) it's a symlink, so the real condsafe downloads below.
+_CS="$MODELS_DIR/loras/ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors"
+[ -L "$_CS" ] && { echo "  removing stale condsafe symlink -> $(readlink "$_CS")"; rm -f "$_CS"; }
+
 # ---- Canonical real files (bf16; skipped if already on disk) ----
 get "$LH/ltx-2.3-22b-dev.safetensors"                 checkpoints   ltx-2.3-22b-dev.safetensors                  # base model (44 GB)
 get "$S/sulphur_lora_rank_768.safetensors"            loras         sulphur_lora_rank_768.safetensors            # Sulphur uncensoring LoRA (9.8 GB)
-get "$LH/ltx-2.3-22b-distilled-lora-384.safetensors"  loras         ltx-2.3-22b-distilled-lora-384.safetensors   # distill LoRA (7.3 GB)
+get "$LH/ltx-2.3-22b-distilled-lora-384.safetensors"  loras         ltx-2.3-22b-distilled-lora-384.safetensors   # distill LoRA (7.6 GB) — used by the OFFICIAL single-stage workflow
+get "$S/distill_loras/ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors" loras ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors  # condsafe distill LoRA (0.66 GB) — the Sulphur hi-res refine LoRA (DISTINCT file, NOT distill-384)
 get "$CO/text_encoders/gemma_3_12B_it.safetensors"    text_encoders gemma_3_12B_it.safetensors                   # Gemma encoder bf16 (23 GB)
 #   To save ~17 GB (encoder precision doesn't affect output), use fp8 instead and
 #   the symlinks below still work — comment the line above and uncomment this:
@@ -42,8 +49,8 @@ get "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/vae/taeltx2_3.safete
 link ltx-2.3-22b-dev.safetensors             checkpoints   ltx-2.3-22b-dev-fp8.safetensors
 # Sulphur LoRA placeholder name used in the workflow
 link sulphur_lora_rank_768.safetensors       loras         sulphur_final.safetensors
-# Distill-LoRA name variants -> the one real distill LoRA
-link ltx-2.3-22b-distilled-lora-384.safetensors loras      ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors
+# condsafe is its OWN real file (downloaded above) — do NOT alias it to distill-384.
+# Distill-384 path-variant -> the real distill-384 (the OFFICIAL workflow's nested ref)
 link ../../ltx-2.3-22b-distilled-lora-384.safetensors loras/ltxv/ltx2 ltx-2.3-22b-distilled-lora-384-1.1.safetensors
 # Gemma encoder name variants -> the one real encoder
 link gemma_3_12B_it.safetensors              text_encoders comfy_gemma_3_12B_it.safetensors
