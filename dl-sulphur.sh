@@ -35,6 +35,7 @@ get "$CO/text_encoders/gemma_3_12B_it.safetensors"    text_encoders gemma_3_12B_
 #   the symlinks below still work — comment the line above and uncomment this:
 # get "$CO/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors" text_encoders gemma_3_12B_it.safetensors
 get "$LH/ltx-2.3-spatial-upscaler-x2-1.0.safetensors" checkpoints   ltx-2.3-spatial-upscaler-x2-1.0.safetensors  # hi-res upscaler (0.95 GB)
+get "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/vae/taeltx2_3.safetensors" vae taeltx2_3.safetensors   # preview TAE (22 MB, Kijai)
 
 # ---- Symlinks so BOTH workflows resolve their (differently-named) refs ----
 # Checkpoint: Sulphur workflow's "stock dev" slot is named *-fp8 -> point at the bf16 file
@@ -49,6 +50,8 @@ link gemma_3_12B_it.safetensors              text_encoders comfy_gemma_3_12B_it.
 link gemma_3_12B_it.safetensors              text_encoders gemma_3_12B_it_fp4_mixed.safetensors
 # Upscaler also mirrored into upscale_models/ (in case the node looks there)
 link ../checkpoints/ltx-2.3-spatial-upscaler-x2-1.0.safetensors upscale_models ltx-2.3-spatial-upscaler-x2-1.0.safetensors
+# Preview TAE mirrored into vae_approx/ (in case the preview node looks there)
+link ../vae/taeltx2_3.safetensors vae_approx taeltx2_3.safetensors
 
 # ---- Both workflow JSONs (unmodified — the symlinks make their refs resolve) ----
 WF_DIR="$COMFY/user/default/workflows"; mkdir -p "$WF_DIR"
@@ -64,5 +67,5 @@ echo "Done. Both workflows resolve via symlinks (no JSON editing):"
 echo "  Sulphur (uncensored):  ltx23_t2v_base_sulphur.json"
 echo "  Official (stock):      LTX-2.3_T2V_I2V_Single_Stage_Distilled_Full.json"
 echo "Uncensoring = the Sulphur LoRA (sulphur_final). Dial its strength (0.5-1.0) in the UI."
-echo "NOTE: taeltx2_3.safetensors (preview TAE) isn't published — if the LTX2SamplingPreviewOverride"
-echo "      node errors, bypass it (Ctrl+B); it only affects live preview, not the output."
+echo "Preview TAE (taeltx2_3) fetched to vae/ (+ vae_approx/). If LTX2SamplingPreviewOverride still"
+echo "can't find it, point it at that file or bypass the node (Ctrl+B) — it's preview-only."
