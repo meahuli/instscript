@@ -119,6 +119,14 @@ for repo_spec in "${NODES[@]}"; do
   fi
 done
 
+# --- Pin deps that ComfyUI-LTXVideo leaves unbounded (its requirements.txt has no
+#     upper bound, so a fresh install grabs incompatible 'latest' and shows IMPORT FAILED):
+#       transformers 5.x removed APIs the node imports;
+#       latest kornia dropped 'pad' from kornia.geometry.transform.pyramid.
+#     0.7.4 still exports pad + the pyramid helpers; transformers 4.5x is fine.
+$PIP install "transformers[timm]>=4.50.0,<5" "kornia==0.7.4" -c "$CONSTRAINTS" \
+  || echo "   LTX dep-pin FAILED — run manually: pip install 'transformers[timm]<5' 'kornia==0.7.4'"
+
 # ============================================================
 # 2) MODELS — separate scripts; run whichever you need AFTER this, from this
 #    same folder, e.g.:
