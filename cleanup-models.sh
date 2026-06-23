@@ -13,7 +13,18 @@
 # workflows, outputs, or anything outside models/.
 # ============================================================
 set -uo pipefail
-COMFY="${COMFY:-/workspace/runpod-slim/ComfyUI}"
+
+# --- locate ComfyUI across providers (runpod-slim, Vast, generic) ---
+# Override on any host with:  COMFY=/path/to/ComfyUI bash cleanup-models.sh
+if [ -z "${COMFY:-}" ]; then
+  for c in /workspace/runpod-slim/ComfyUI /workspace/ComfyUI /opt/ComfyUI "${HOME:-/root}/ComfyUI" /ComfyUI; do
+    [ -f "$c/main.py" ] && { COMFY="$c"; break; }
+  done
+fi
+if [ -z "${COMFY:-}" ] || [ ! -d "$COMFY" ]; then
+  echo "ERROR: ComfyUI not found. Set it explicitly:  COMFY=/path/to/ComfyUI bash $0" >&2
+  exit 1
+fi
 MODELS="$COMFY/models"
 SUB="${1:-}"
 TARGET="$MODELS${SUB:+/$SUB}"

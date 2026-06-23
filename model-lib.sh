@@ -2,21 +2,52 @@
 # ============================================================
 # model-lib.sh — shared helper for the dl-*.sh model scripts.
 # It is SOURCED by them (don't run it directly). Locates the
-# runpod-slim ComfyUI models dir and provides a resumable,
-# skip-if-present aria2c downloader.
+# ComfyUI models dir (RunPod runpod-slim, Vast, or generic
+# images) and provides a resumable, skip-if-present aria2c
+# downloader.
 #
-# Token-free by default. For gated repos, set HF_TOKEN as a RunPod
-# env var; this reads it.
+# Token-free by default. For gated repos, set HF_TOKEN as an env
+# var — RunPod env var, or on Vast pass "-e HF_TOKEN=..." / export
+# it in the On-start Script; this reads it either way.
+#
+# ComfyUI location is auto-detected. Override on any host with:
+#   COMFY=/path/to/ComfyUI bash dl-xxx.sh
 # ============================================================
 set -uo pipefail
 
-COMFY="${COMFY:-/workspace/runpod-slim/ComfyUI}"
-MODELS_DIR="$COMFY/models"
+# --- locate ComfyUI across providers (runpod-slim, Vast, generic) ---
+# Priority: explicit $COMFY > known install paths > shallow search.
+_find_comfy() {
+  local c root
+  if [ -n "${COMFY:-}" ]; then            # explicit override wins
+    printf '%s\n' "$COMFY"; return 0
+  fi
+  for c in \
+      /workspace/runpod-slim/ComfyUI \
+      /workspace/ComfyUI \
+      /opt/ComfyUI \
+      "${HOME:-/root}/ComfyUI" \
+      /ComfyUI ; do
+    [ -f "$c/main.py" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  for root in /workspace /opt /root / ; do
+    [ -d "$root" ] || continue
+    c=$(find "$root" -maxdepth 5 -name main.py -path '*/ComfyUI/main.py' 2>/dev/null | head -n1)
+    [ -n "$c" ] && { dirname "$c"; return 0; }
+  done
+  return 1
+}
 
-if [ ! -d "$COMFY" ]; then
-  echo "ERROR: $COMFY not found — let the pod finish first boot (ComfyUI up once), then retry." >&2
+COMFY="$(_find_comfy || true)"
+if [ -z "$COMFY" ] || [ ! -d "$COMFY" ]; then
+  echo "ERROR: ComfyUI not found." >&2
+  echo "  Looked in: /workspace/runpod-slim/ComfyUI, /workspace/ComfyUI, /opt/ComfyUI, \$HOME/ComfyUI, /ComfyUI" >&2
+  echo "  If the pod is still booting, wait for ComfyUI to come up once, then retry." >&2
+  echo "  Or set the path explicitly:  COMFY=/path/to/ComfyUI bash $0" >&2
   exit 1
 fi
+echo "==> Using ComfyUI at: $COMFY"
+MODELS_DIR="$COMFY/models"
 mkdir -p "$MODELS_DIR"/{diffusion_models,text_encoders,vae,loras,pulid,controlnet,clip,clip_vision,unet,upscale_models}
 
 command -v aria2c >/dev/null 2>&1 || { echo "==> installing aria2"; apt-get update -qq && apt-get install -y -qq aria2; }
