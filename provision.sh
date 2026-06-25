@@ -129,7 +129,23 @@ $PIP install "transformers[timm]>=4.50.0,<5" "kornia==0.7.4" -c "$CONSTRAINTS" \
   || echo "   LTX dep-pin FAILED — run manually: pip install 'transformers[timm]<5' 'kornia==0.7.4'"
 
 # ============================================================
-# 2) MODELS — separate scripts; run whichever you need AFTER this, from this
+# 2) WORKFLOWS — copy the *.json bundled in this repo into ComfyUI's workflows
+#    dir so they appear in the Workflows sidebar (ComfyUI only scans that folder;
+#    files sitting in this repo dir are otherwise invisible to the UI).
+# ============================================================
+WF_DIR="$COMFY/user/default/workflows"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+mkdir -p "$WF_DIR"
+if ls "$SELF_DIR"/*.json >/dev/null 2>&1; then
+  cp -f "$SELF_DIR"/*.json "$WF_DIR/"
+  echo "==> deployed workflow JSONs -> $WF_DIR:"
+  ls -1 "$SELF_DIR"/*.json | sed 's#.*/#     #'
+else
+  echo "==> no workflow JSONs next to provision.sh — skipping sidebar deploy"
+fi
+
+# ============================================================
+# 3) MODELS — separate scripts; run whichever you need AFTER this, from this
 #    same folder, e.g.:
 #       bash "$(dirname "$0")/dl-chroma.sh"
 #       bash "$(dirname "$0")/dl-wan.sh"            # MODE=i2v for image-to-video
@@ -138,7 +154,7 @@ $PIP install "transformers[timm]>=4.50.0,<5" "kornia==0.7.4" -c "$CONSTRAINTS" \
 # ============================================================
 
 # ============================================================
-# 3) COMFYUI ARGS
+# 4) COMFYUI ARGS
 #    RunPod runpod-slim -> written to comfyui_args.txt (read on restart).
 #    Vast / other       -> args come from the COMFYUI_ARGS env var (template); not written here.
 # ============================================================
