@@ -37,8 +37,10 @@ CO="https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files"
 # 1) dev checkpoint (fp8 or bf16) -> checkpoints/
 get "$CKPT_URL" checkpoints "$CKPT"
 
-# 2) distilled LoRA -> loras/ltxv/ltx2/  (workflow references this subpath)
-get "$LH/ltx-2.3-22b-distilled-lora-384-1.1.safetensors" loras/ltxv/ltx2 ltx-2.3-22b-distilled-lora-384-1.1.safetensors
+# 2) distilled LoRA -> loras/  (FLAT. The official workflows' ltxv/ltx2/ subpath is
+#    flattened on deploy below, so this one flat copy serves every workflow — and lets
+#    auto-downloaders that can't write subfolders, e.g. ComfyUI-AutoModelDownloader, find it.)
+get "$LH/ltx-2.3-22b-distilled-lora-384-1.1.safetensors" loras ltx-2.3-22b-distilled-lora-384-1.1.safetensors
 
 # 3) spatial upscaler (x2) -> latent_upscale_models/  (the 2nd stage of the Two-Stage
 #    workflow; loaded by LatentUpscaleModelLoader, which reads the 'latent_upscale_models'
@@ -59,6 +61,10 @@ for WF_NAME in \
     LTX-2.3_T2V_I2V_Two_Stage_Distilled.json ; do
   aria2c $ARIA_OPTS --dir="$WF_DIR" --out="$WF_NAME" "$WFBASE/$WF_NAME" \
     || echo "  (workflow JSON download failed: $WF_NAME — fetch it manually from the repo)"
+  if [ -f "$WF_DIR/$WF_NAME" ]; then
+    # flatten the distill-LoRA subpath (ltxv/ltx2/...) to match the flat loras/ download above
+    sed -i 's|ltxv/ltx2/ltx-2.3-22b-distilled|ltx-2.3-22b-distilled|g' "$WF_DIR/$WF_NAME"
+  fi
   if [ "$PRECISION" = "fp8" ] && [ -f "$WF_DIR/$WF_NAME" ]; then
     sed -i 's/ltx-2\.3-22b-dev\.safetensors/ltx-2.3-22b-dev-fp8.safetensors/g' "$WF_DIR/$WF_NAME"
     echo "==> patched $WF_NAME checkpoint -> $CKPT (drop-in, no dropdown change)"
