@@ -79,7 +79,7 @@ NODES=(
   "https://github.com/city96/ComfyUI-GGUF"            # load GGUF-quantized models + GGUF text encoders
   "https://github.com/Lightricks/ComfyUI-LTXVideo"    # LTX-2.x video nodes — needed by dl-ltx23.sh
   "https://github.com/ClownsharkBatwing/RES4LYF"      # advanced samplers/guiders — LTX-2.3 workflow
-  "https://github.com/FNGarvin/ComfyUI-AutoModelDownloader"  # "Missing Models -> Download All" from workflow-embedded URLs (de-RunPod'd fork; flat folders only)
+  "https://github.com/MadiatorLabs/ComfyUI-RunpodDirect" #Runpoddirect model downloader
   # add more when you need them, e.g.:
   # "https://github.com/Fannovel16/comfyui_controlnet_aux"
   # "https://github.com/Gourieff/ComfyUI-ReActor"
