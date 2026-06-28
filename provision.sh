@@ -148,6 +148,7 @@ fi
 # 3) MODELS — separate scripts; run whichever you need AFTER this, from this
 #    same folder, e.g.:
 #       bash "$(dirname "$0")/dl-chroma.sh"
+#       bash "$(dirname "$0")/dl-hunyuan.sh"        # MODE=i2v for image-to-video
 #       bash "$(dirname "$0")/dl-wan.sh"            # MODE=i2v for image-to-video
 #       bash "$(dirname "$0")/dl-ltx23.sh"         # PRECISION=bf16 for max quality
 #    Each is resumable and skips files already present (model-lib auto-detects ComfyUI).
