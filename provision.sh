@@ -150,6 +150,7 @@ fi
 #       bash "$(dirname "$0")/dl-chroma.sh"
 #       bash "$(dirname "$0")/dl-hunyuan.sh"        # MODE=i2v for image-to-video
 #       bash "$(dirname "$0")/dl-hunyuan15-i2v.sh" # HunyuanVideo 1.5 720p I2V workflow
+#       bash "$(dirname "$0")/dl-hunyuan15-t2v.sh" # HunyuanVideo 1.5 720p T2V workflow
 #       bash "$(dirname "$0")/dl-wan.sh"            # MODE=i2v for image-to-video
 #       bash "$(dirname "$0")/dl-ltx23.sh"         # PRECISION=bf16 for max quality
 #    Each is resumable and skips files already present (model-lib auto-detects ComfyUI).
