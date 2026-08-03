@@ -151,9 +151,15 @@ if [ -d "$SELF_DIR/custom_nodes" ]; then
 fi
 
 # ============================================================
-# 2) WORKFLOWS — copy the *.json bundled in this repo into ComfyUI's workflows
-#    dir so they appear in the Workflows sidebar (ComfyUI only scans that folder;
-#    files sitting in this repo dir are otherwise invisible to the UI).
+# 2) WORKFLOWS — copy any *.json sitting next to this script into ComfyUI's
+#    workflows dir so they appear in the Workflows sidebar (ComfyUI only scans
+#    that folder; JSONs anywhere else are invisible to the UI).
+#
+#    The workflow JSONs no longer ship in this repo — they are kept outside it.
+#    To get them onto a pod, either drop them beside provision.sh before running
+#    it, or copy them straight to the dir below afterwards:
+#       cp /workspace/workflows/*.json "$COMFY/user/default/workflows/"
+#    This step is a no-op when there is nothing beside the script.
 # ============================================================
 WF_DIR="$COMFY/user/default/workflows"
 mkdir -p "$WF_DIR"
