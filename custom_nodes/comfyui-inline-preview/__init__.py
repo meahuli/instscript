@@ -126,53 +126,125 @@ _GALLERY_HTML = """<!doctype html>
  .row a{color:#7db3e8;text-decoration:none}
  .row a:hover{text-decoration:underline}
  .empty{color:#666;padding:32px 0;text-align:center}
+ label.tog{color:#888;font-size:12px;display:flex;align-items:center;gap:5px;
+           cursor:pointer;user-select:none}
 </style>
 <header>
   <h1>inline preview &mdash; RAM store</h1>
-  <div style="display:flex;gap:8px;align-items:center">
+  <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
     <span class="meta" id="meta">loading...</span>
+    <label class="tog"><input type="checkbox" id="blobmode" checked
+      onchange="setBlobMode(this.checked)">keep in browser</label>
     <button onclick="load()">refresh</button>
     <button class="danger" onclick="wipe()">clear all</button>
   </div>
 </header>
 <div id="grid"></div>
 <script>
+const EXT = {'image/png':'.png','image/jpeg':'.jpg','image/webp':'.webp',
+             'video/mp4':'.mp4','video/webm':'.webm'};
 const human = b => { const u=['B','KB','MB','GB']; let i=0,n=b;
   while(n>=1024&&i<u.length-1){n/=1024;i++;} return n.toFixed(n<10&&i>0?1:0)+' '+u[i]; };
 const ago = s => s<60?Math.round(s)+'s ago'
   : s<3600?Math.round(s/60)+'m ago' : (s/3600).toFixed(1)+'h ago';
+const srcOf = it => '../inline_preview?id='+encodeURIComponent(it.id);
+
+// "keep in browser": pull each item into a Blob as it scrolls into view, then
+// render from an object URL. Survives the pod going away, for the life of this
+// tab. Lazy on purpose -- blobbing the whole store on open would pull GBs.
+let blobMode = true;
+const held = new Map();       // id -> object URL
+let heldBytes = 0;
+let listing = {items:[],bytes:0,max_bytes:0};
+let io = null;
+
+function revokeAll(){
+  for(const u of held.values()) URL.revokeObjectURL(u);
+  held.clear(); heldBytes = 0;
+}
+
+function updateMeta(){
+  document.getElementById('meta').textContent =
+    listing.items.length+' items \\u00b7 '+human(listing.bytes)+' / '
+    +human(listing.max_bytes)
+    +(blobMode && heldBytes ? ' \\u00b7 '+human(heldBytes)+' held in browser' : '');
+}
+
+function setBlobMode(on){ blobMode = on; revokeAll(); load(); }
+
+async function hydrate(card, it){
+  if(!blobMode || held.has(it.id)) return;
+  try{
+    const r = await fetch(srcOf(it), {cache:'no-store'});
+    if(!r.ok) return;
+    const b = await r.blob();
+    if(!blobMode || !card.isConnected) return;   // toggled off / reloaded mid-flight
+    const o = URL.createObjectURL(b);
+    held.set(it.id, o); heldBytes += b.size;
+    const m = card.querySelector('img,video'); if(m) m.src = o;
+    const a = card.querySelector('a');         if(a) a.href = o;
+    updateMeta();
+  }catch(e){ /* leave the direct URL in place */ }
+}
 
 async function load(){
   const grid = document.getElementById('grid');
-  let d;
-  try { d = await (await fetch('list',{cache:'no-store'})).json(); }
+  if(io){ io.disconnect(); io = null; }
+
+  try { listing = await (await fetch('list',{cache:'no-store'})).json(); }
   catch(e){ grid.innerHTML='<div class="empty">could not reach ComfyUI</div>'; return; }
 
-  document.getElementById('meta').textContent =
-    d.items.length+' items \\u00b7 '+human(d.bytes)+' / '+human(d.max_bytes);
-
+  updateMeta();
   grid.replaceChildren();
-  if(!d.items.length){
+  if(!listing.items.length){
     grid.innerHTML='<div class="empty">store is empty &mdash; queue a prompt</div>';
     return;
   }
-  for(const it of d.items){
-    const url = '../inline_preview?id='+encodeURIComponent(it.id);
+
+  const owner = new Map();
+  io = new IntersectionObserver(es => {
+    for(const e of es) if(e.isIntersecting){
+      io.unobserve(e.target);
+      hydrate(e.target, owner.get(e.target));
+    }
+  }, {rootMargin:'300px'});
+
+  for(const it of listing.items){
+    const url = srcOf(it);
     const card = document.createElement('div');
-    card.className='card';
-    // preload="none" so opening the gallery does not pull every clip at once
-    card.innerHTML = (it.type.startsWith('video/')
-        ? '<video src="'+url+'" controls loop muted playsinline preload="none"></video>'
-        : '<img src="'+url+'" loading="lazy">')
-      + '<div class="row"><span>'+human(it.bytes)+' \\u00b7 '+ago(it.age)+'</span>'
-      + '<a href="'+url+'" download="preview-'+it.id.slice(0,8)+'">save</a></div>';
+    card.className = 'card';
+
+    const media = document.createElement(it.type.startsWith('video/')?'video':'img');
+    if(media.tagName === 'VIDEO'){
+      media.controls = true; media.loop = true; media.muted = true;
+      media.playsInline = true; media.preload = 'none';
+    } else {
+      media.loading = 'lazy';
+    }
+    // In blob mode leave src empty so the only fetch is the one hydrate() makes.
+    if(!blobMode) media.src = url;
+
+    const row = document.createElement('div');
+    row.className = 'row';
+    const span = document.createElement('span');
+    span.textContent = human(it.bytes)+' \\u00b7 '+ago(it.age);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'preview-'+it.id.slice(0,8)+(EXT[it.type]||'');
+    a.textContent = 'save';
+    row.append(span, a);
+
+    card.append(media, row);
     grid.appendChild(card);
+    owner.set(card, it);
+    if(blobMode) io.observe(card);
   }
 }
 
 async function wipe(){
   if(!confirm('Drop every preview held in RAM? This cannot be undone.')) return;
   await fetch('clear',{method:'POST'});
+  revokeAll();
   load();
 }
 
