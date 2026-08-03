@@ -315,12 +315,15 @@ class PreviewVideoInline:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "images": ("IMAGE",),
-                "fps": ("FLOAT", {"default": 16.0, "min": 0.1, "max": 240.0, "step": 0.1}),
+                "fps": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 240.0, "step": 0.1,
+                                  "tooltip": "0 = use the VIDEO input's own frame rate "
+                                             "(or 16 for a bare IMAGE batch)."}),
                 "quality": ("INT", {"default": 85, "min": 1, "max": 100,
                                     "tooltip": "Only used by the animated-WebP fallback."}),
             },
             "optional": {
+                "video": ("VIDEO",),
+                "images": ("IMAGE",),
                 "audio": ("AUDIO",),
             },
         }
@@ -329,24 +332,42 @@ class PreviewVideoInline:
     FUNCTION = "preview"
     OUTPUT_NODE = True
     CATEGORY = "image/video"
-    DESCRIPTION = "Preview a frame batch as video in the browser without writing any file."
+    DESCRIPTION = ("Preview video in the browser without writing any file. Takes either a "
+                   "VIDEO (drop-in for SaveVideo) or a raw IMAGE frame batch.")
 
     @classmethod
     def IS_CHANGED(cls, *args, **kwargs):
         return float("nan")
 
-    def preview(self, images, fps=16.0, quality=85, audio=None):
+    def preview(self, fps=0.0, quality=85, video=None, images=None, audio=None):
+        src_fps = None
+
+        if video is not None:
+            # Re-encode from components rather than VideoInput.save_to(), which
+            # only takes a filesystem path -- that would defeat the whole point.
+            comps = video.get_components()
+            images = comps.images
+            if audio is None:
+                audio = getattr(comps, "audio", None)
+            if getattr(comps, "frame_rate", None):
+                src_fps = float(comps.frame_rate)
+
+        if images is None:
+            raise ValueError("PreviewVideoInline: connect either 'video' or 'images'.")
+
+        rate = fps if fps and fps > 0 else (src_fps or 16.0)
+
         arr = _to_uint8(images)
         if arr.shape[0] == 0:
             return {"ui": {"inline": []}}
 
-        data, mime = _encode_video(arr, fps, audio)
+        data, mime = _encode_video(arr, rate, audio)
         if data is None:
-            data, mime = _encode_animated_webp(arr, fps, quality)
+            data, mime = _encode_animated_webp(arr, rate, quality)
 
         return {"ui": {"inline": [
             {"id": STORE.put(data, mime), "type": mime, "bytes": len(data),
-             "frames": int(arr.shape[0])}
+             "frames": int(arr.shape[0]), "fps": round(rate, 3)}
         ]}}
 
 

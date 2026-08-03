@@ -3,8 +3,19 @@
 Two output nodes that show results in the ComfyUI browser **without writing a
 file anywhere** — not to the volume, not to the container disk, not to tmpfs.
 
-- **Preview Image (RAM, no file)** — `PreviewImageInline`
-- **Preview Video (RAM, no file)** — `PreviewVideoInline`
+- **Preview Image (RAM, no file)** — `PreviewImageInline`, takes `IMAGE`
+- **Preview Video (RAM, no file)** — `PreviewVideoInline`, takes `VIDEO` *or* `IMAGE`
+
+`PreviewVideoInline` is a drop-in for `SaveVideo`: connect the `VIDEO` from
+`CreateVideo` (as in `LTX-2.3_T2V_I2V_Two_Stage_NonDistilledStage1.json`) and it
+pulls frames, audio and frame rate off the video via `get_components()`, then
+re-encodes in memory. It deliberately avoids `VideoInput.save_to()`, which only
+accepts a filesystem path.
+
+Alternatively feed a raw `IMAGE` batch straight off `VAEDecode` — useful for
+Hunyuan/Wan/LTX graphs where you want to look at frames before they're muxed.
+Leave `fps` at `0` to inherit the source frame rate (16 for a bare `IMAGE`
+batch), or set it to override.
 
 ## Why not just base64 into the `ui` payload
 
