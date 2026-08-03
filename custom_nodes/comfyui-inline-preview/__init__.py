@@ -14,6 +14,7 @@ Store size: INLINE_PREVIEW_MAX_MB env var (default 2048).
 
 import io
 import os
+import time
 import uuid
 import logging
 import threading
@@ -45,19 +46,19 @@ _EXT = {
 class BlobStore:
     def __init__(self, max_bytes):
         self.max_bytes = max_bytes
-        self._items = OrderedDict()  # id -> (bytes, content_type)
+        self._items = OrderedDict()  # id -> (bytes, content_type, created_wall)
         self._bytes = 0
         self._lock = threading.Lock()
 
     def put(self, data, content_type):
         key = uuid.uuid4().hex
         with self._lock:
-            self._items[key] = (data, content_type)
+            self._items[key] = (data, content_type, time.time())
             self._bytes += len(data)
             # keep at least one entry so a single oversized result still shows
             while self._bytes > self.max_bytes and len(self._items) > 1:
-                _, (old, _ct) = self._items.popitem(last=False)
-                self._bytes -= len(old)
+                _, evicted = self._items.popitem(last=False)
+                self._bytes -= len(evicted[0])
         return key
 
     def get(self, key):
@@ -66,6 +67,18 @@ class BlobStore:
             if item is not None:
                 self._items.move_to_end(key)
             return item
+
+    def listing(self):
+        """Newest first. The store is the source of truth -- unlike prompt
+        history, which keeps ids long after their bytes have been evicted."""
+        now = time.time()
+        with self._lock:
+            items = [
+                {"id": k, "type": v[1], "bytes": len(v[0]), "age": round(now - v[2], 1)}
+                for k, v in self._items.items()
+            ]
+        items.reverse()
+        return {"items": items, "bytes": self._bytes, "max_bytes": self.max_bytes}
 
     def stats(self):
         with self._lock:
@@ -84,6 +97,90 @@ class BlobStore:
 STORE = BlobStore(MAX_STORE_BYTES)
 
 
+# All URLs below are relative to /inline_preview/ so the page works unchanged
+# behind a proxied path prefix (RunPod) as well as on a bare localhost tunnel.
+_GALLERY_HTML = """<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>inline preview - RAM store</title>
+<style>
+ :root{color-scheme:dark}
+ body{margin:0;padding:16px;background:#0d0d0d;color:#ddd;
+      font:13px/1.5 system-ui,sans-serif}
+ h1{font-size:15px;font-weight:600;margin:0}
+ header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;
+        justify-content:space-between;margin-bottom:14px}
+ .meta{color:#888;font-size:12px}
+ button{background:#1e1e1e;color:#ddd;border:1px solid #333;border-radius:4px;
+        padding:5px 11px;font:inherit;cursor:pointer}
+ button:hover{background:#2a2a2a}
+ button.danger:hover{background:#5a2020;border-color:#7a3030}
+ #grid{display:grid;gap:12px;
+       grid-template-columns:repeat(auto-fill,minmax(240px,1fr))}
+ .card{background:#161616;border:1px solid #262626;border-radius:6px;
+       overflow:hidden;display:flex;flex-direction:column}
+ .card img,.card video{width:100%;aspect-ratio:1;object-fit:contain;
+                       background:#000;display:block}
+ .row{display:flex;justify-content:space-between;align-items:center;
+      gap:8px;padding:7px 9px;font-size:11px;color:#8a8a8a}
+ .row a{color:#7db3e8;text-decoration:none}
+ .row a:hover{text-decoration:underline}
+ .empty{color:#666;padding:32px 0;text-align:center}
+</style>
+<header>
+  <h1>inline preview &mdash; RAM store</h1>
+  <div style="display:flex;gap:8px;align-items:center">
+    <span class="meta" id="meta">loading...</span>
+    <button onclick="load()">refresh</button>
+    <button class="danger" onclick="wipe()">clear all</button>
+  </div>
+</header>
+<div id="grid"></div>
+<script>
+const human = b => { const u=['B','KB','MB','GB']; let i=0,n=b;
+  while(n>=1024&&i<u.length-1){n/=1024;i++;} return n.toFixed(n<10&&i>0?1:0)+' '+u[i]; };
+const ago = s => s<60?Math.round(s)+'s ago'
+  : s<3600?Math.round(s/60)+'m ago' : (s/3600).toFixed(1)+'h ago';
+
+async function load(){
+  const grid = document.getElementById('grid');
+  let d;
+  try { d = await (await fetch('list',{cache:'no-store'})).json(); }
+  catch(e){ grid.innerHTML='<div class="empty">could not reach ComfyUI</div>'; return; }
+
+  document.getElementById('meta').textContent =
+    d.items.length+' items \\u00b7 '+human(d.bytes)+' / '+human(d.max_bytes);
+
+  grid.replaceChildren();
+  if(!d.items.length){
+    grid.innerHTML='<div class="empty">store is empty &mdash; queue a prompt</div>';
+    return;
+  }
+  for(const it of d.items){
+    const url = '../inline_preview?id='+encodeURIComponent(it.id);
+    const card = document.createElement('div');
+    card.className='card';
+    // preload="none" so opening the gallery does not pull every clip at once
+    card.innerHTML = (it.type.startsWith('video/')
+        ? '<video src="'+url+'" controls loop muted playsinline preload="none"></video>'
+        : '<img src="'+url+'" loading="lazy">')
+      + '<div class="row"><span>'+human(it.bytes)+' \\u00b7 '+ago(it.age)+'</span>'
+      + '<a href="'+url+'" download="preview-'+it.id.slice(0,8)+'">save</a></div>';
+    grid.appendChild(card);
+  }
+}
+
+async function wipe(){
+  if(!confirm('Drop every preview held in RAM? This cannot be undone.')) return;
+  await fetch('clear',{method:'POST'});
+  load();
+}
+
+load();
+</script>
+"""
+
+
 # --------------------------------------------------------------------------
 # HTTP routes
 # --------------------------------------------------------------------------
@@ -93,7 +190,7 @@ async def _inline_preview(request):
     item = STORE.get(key)
     if item is None:
         return web.Response(status=404, text="expired: evicted from the RAM store")
-    data, content_type = item
+    data, content_type, _created = item
     return web.Response(
         body=data,
         content_type=content_type,
@@ -105,6 +202,11 @@ async def _inline_preview(request):
     )
 
 
+@PromptServer.instance.routes.get("/inline_preview/list")
+async def _inline_preview_list(request):
+    return web.json_response(STORE.listing())
+
+
 @PromptServer.instance.routes.get("/inline_preview/stats")
 async def _inline_preview_stats(request):
     return web.json_response(STORE.stats())
@@ -114,6 +216,12 @@ async def _inline_preview_stats(request):
 async def _inline_preview_clear(request):
     STORE.clear()
     return web.json_response(STORE.stats())
+
+
+@PromptServer.instance.routes.get("/inline_preview/gallery")
+async def _inline_preview_gallery(request):
+    return web.Response(text=_GALLERY_HTML, content_type="text/html",
+                        headers={"Cache-Control": "no-store"})
 
 
 # --------------------------------------------------------------------------
@@ -369,6 +477,14 @@ class PreviewVideoInline:
             {"id": STORE.put(data, mime), "type": mime, "bytes": len(data),
              "frames": int(arr.shape[0]), "fps": round(rate, 3)}
         ]}}
+
+
+try:
+    from . import history_redact
+    history_redact.install()
+except Exception as e:  # never let this take the nodes down with it
+    log.error("inline_preview: history redaction could not be installed (%s). "
+              "Prompts REMAIN readable via GET /history.", e)
 
 
 NODE_CLASS_MAPPINGS = {
