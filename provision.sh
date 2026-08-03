@@ -166,14 +166,13 @@ else
 fi
 
 # ============================================================
-# 3) MODELS — separate scripts; run whichever you need AFTER this, from this
-#    same folder, e.g.:
-#       bash "$(dirname "$0")/dl-chroma.sh"
-#       bash "$(dirname "$0")/dl-hunyuan.sh"        # MODE=i2v for image-to-video
-#       bash "$(dirname "$0")/dl-hunyuan15-i2v.sh" # HunyuanVideo 1.5 720p I2V workflow
-#       bash "$(dirname "$0")/dl-hunyuan15-t2v.sh" # HunyuanVideo 1.5 720p T2V workflow
-#       bash "$(dirname "$0")/dl-wan.sh"            # MODE=i2v for image-to-video
-#       bash "$(dirname "$0")/dl-ltx23.sh"         # PRECISION=bf16 for max quality
+# 3) MODELS — the dl-*.sh scripts no longer live in this repo; they are kept
+#    outside it alongside model-lib.sh, which every one of them sources from
+#    its own directory. Copy that folder onto the pod and run whichever you
+#    need AFTER this script, keeping model-lib.sh next to them, e.g.:
+#       bash /workspace/dlscripts/dl-chroma.sh
+#       MODE=i2v bash /workspace/dlscripts/dl-wan.sh
+#       PRECISION=bf16 bash /workspace/dlscripts/dl-ltx23.sh
 #    Each is resumable and skips files already present (model-lib auto-detects ComfyUI).
 # ============================================================
 
