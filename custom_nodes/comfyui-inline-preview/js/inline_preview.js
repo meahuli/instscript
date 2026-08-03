@@ -3,6 +3,16 @@ import { api } from "../../scripts/api.js";
 
 const NODES = new Set(["PreviewImageInline", "PreviewVideoInline"]);
 
+// A blob: URL carries no Content-Disposition, so the download attribute is the
+// only source of a filename -- without this, saves land with no extension.
+const EXT = {
+  "image/png": ".png",
+  "image/jpeg": ".jpg",
+  "image/webp": ".webp",
+  "video/mp4": ".mp4",
+  "video/webm": ".webm",
+};
+
 function container() {
   const el = document.createElement("div");
   el.style.cssText = [
@@ -19,7 +29,7 @@ function note(el, text, colour) {
   const p = document.createElement("div");
   p.textContent = text;
   p.style.cssText = `color:${colour};font:11px sans-serif;text-align:center;padding:8px;`;
-  el.appendChild(p);
+  el.replaceChildren(p);
 }
 
 function human(bytes) {
@@ -30,9 +40,67 @@ function human(bytes) {
   return `${n.toFixed(n < 10 && i > 0 ? 1 : 0)} ${u[i]}`;
 }
 
+function revokeAll(node) {
+  for (const u of node._inlineObjectUrls || []) URL.revokeObjectURL(u);
+  node._inlineObjectUrls = [];
+}
+
+// Pull the bytes once into a Blob and render from an object URL. Everything
+// after that is served from browser memory: redraws cost no request, and
+// playback, seeking and download keep working once the pod is gone. Lives for
+// the life of the tab -- a reload drops it, since blobs die with the document.
+async function hydrate(node, item, wrap) {
+  const url = api.apiURL(`/inline_preview?id=${encodeURIComponent(item.id)}`);
+
+  let obj;
+  try {
+    const r = await fetch(url, { cache: "no-store" });
+    if (!r.ok) throw new Error(r.status === 404 ? "expired" : `HTTP ${r.status}`);
+    obj = URL.createObjectURL(await r.blob());
+  } catch (e) {
+    note(wrap, e.message === "expired"
+      ? "preview expired (evicted from the RAM store) — re-queue to regenerate"
+      : `could not load preview (${e.message})`, "#c88");
+    return;
+  }
+
+  // The node may have re-executed while this fetch was in flight.
+  if (!wrap.isConnected) { URL.revokeObjectURL(obj); return; }
+  (node._inlineObjectUrls ||= []).push(obj);
+
+  let media;
+  if (String(item.type).startsWith("video/")) {
+    media = document.createElement("video");
+    media.controls = true;
+    media.loop = true;
+    media.muted = true;
+    media.autoplay = true;
+    media.playsInline = true;
+  } else {
+    media = document.createElement("img");
+  }
+  media.src = obj;
+  media.style.cssText =
+    "max-width:100%;max-height:100%;object-fit:contain;border-radius:3px;";
+
+  const dl = document.createElement("a");
+  dl.href = obj;
+  dl.download = `preview-${item.id.slice(0, 8)}${EXT[item.type] || ""}`;
+  dl.textContent = `save${item.bytes ? ` (${human(item.bytes)})` : ""}`;
+  dl.style.cssText = [
+    "position:absolute", "right:6px", "top:6px",
+    "font:10px sans-serif", "color:#ddd", "text-decoration:none",
+    "background:rgba(0,0,0,.65)", "padding:2px 6px", "border-radius:3px",
+  ].join(";");
+
+  wrap.replaceChildren(media, dl);
+}
+
 function render(node, items) {
   const el = node._inlineEl;
   if (!el) return;
+
+  revokeAll(node);
   el.replaceChildren();
 
   if (!items || items.length === 0) {
@@ -40,46 +108,14 @@ function render(node, items) {
     return;
   }
 
+  // Lay the slots out synchronously, fill each one in as its bytes arrive.
   for (const item of items) {
-    const url = api.apiURL(`/inline_preview?id=${encodeURIComponent(item.id)}`);
-
     const wrap = document.createElement("div");
-    wrap.style.cssText = "position:relative;width:100%;display:flex;justify-content:center;";
-
-    let media;
-    if (String(item.type).startsWith("video/")) {
-      media = document.createElement("video");
-      media.controls = true;
-      media.loop = true;
-      media.muted = true;
-      media.autoplay = true;
-      media.playsInline = true;
-    } else {
-      media = document.createElement("img");
-    }
-    media.src = url;
-    media.style.cssText = "max-width:100%;max-height:100%;object-fit:contain;border-radius:3px;";
-
-    // The store is byte-capped; an old node can outlive its blob.
-    media.addEventListener("error", () => {
-      wrap.replaceChildren();
-      note(wrap, "preview expired (evicted from the RAM store) — re-queue to regenerate", "#c88");
-    });
-
-    // Download without ever having had a file on the server.
-    const dl = document.createElement("a");
-    dl.href = url;
-    dl.download = `preview-${item.id.slice(0, 8)}`;
-    dl.textContent = `save${item.bytes ? ` (${human(item.bytes)})` : ""}`;
-    dl.style.cssText = [
-      "position:absolute", "right:6px", "top:6px",
-      "font:10px sans-serif", "color:#ddd", "text-decoration:none",
-      "background:rgba(0,0,0,.65)", "padding:2px 6px", "border-radius:3px",
-    ].join(";");
-
-    wrap.appendChild(media);
-    wrap.appendChild(dl);
+    wrap.style.cssText =
+      "position:relative;width:100%;display:flex;justify-content:center;";
+    note(wrap, "loading…", "#666");
     el.appendChild(wrap);
+    hydrate(node, item, wrap);
   }
 }
 
@@ -93,6 +129,7 @@ app.registerExtension({
     nodeType.prototype.onNodeCreated = function () {
       const r = onNodeCreated?.apply(this, arguments);
       this._inlineEl = container();
+      this._inlineObjectUrls = [];
       this.addDOMWidget("inline_preview", "preview", this._inlineEl, {
         serialize: false,           // keep blobs out of the saved workflow
         hideOnZoom: false,
@@ -106,6 +143,12 @@ app.registerExtension({
     nodeType.prototype.onExecuted = function (message) {
       onExecuted?.apply(this, arguments);
       render(this, message?.inline);
+    };
+
+    const onRemoved = nodeType.prototype.onRemoved;
+    nodeType.prototype.onRemoved = function () {
+      revokeAll(this);
+      return onRemoved?.apply(this, arguments);
     };
   },
 });
