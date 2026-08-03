@@ -3,8 +3,6 @@ import { api } from "../../scripts/api.js";
 
 const NODES = new Set(["PreviewImageInline", "PreviewVideoInline"]);
 
-// A blob: URL carries no Content-Disposition, so the download attribute is the
-// only source of a filename -- without this, saves land with no extension.
 const EXT = {
   "image/png": ".png",
   "image/jpeg": ".jpg",
@@ -45,10 +43,6 @@ function revokeAll(node) {
   node._inlineObjectUrls = [];
 }
 
-// Pull the bytes once into a Blob and render from an object URL. Everything
-// after that is served from browser memory: redraws cost no request, and
-// playback, seeking and download keep working once the pod is gone. Lives for
-// the life of the tab -- a reload drops it, since blobs die with the document.
 async function hydrate(node, item, wrap) {
   const url = api.apiURL(`/inline_preview?id=${encodeURIComponent(item.id)}`);
 
@@ -64,7 +58,6 @@ async function hydrate(node, item, wrap) {
     return;
   }
 
-  // The node may have re-executed while this fetch was in flight.
   if (!wrap.isConnected) { URL.revokeObjectURL(obj); return; }
   (node._inlineObjectUrls ||= []).push(obj);
 
@@ -108,7 +101,6 @@ function render(node, items) {
     return;
   }
 
-  // Lay the slots out synchronously, fill each one in as its bytes arrive.
   for (const item of items) {
     const wrap = document.createElement("div");
     wrap.style.cssText =
@@ -131,7 +123,7 @@ app.registerExtension({
       this._inlineEl = container();
       this._inlineObjectUrls = [];
       this.addDOMWidget("inline_preview", "preview", this._inlineEl, {
-        serialize: false,           // keep blobs out of the saved workflow
+        serialize: false,
         hideOnZoom: false,
       });
       this.size = [Math.max(this.size[0], 320), Math.max(this.size[1], 340)];

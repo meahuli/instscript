@@ -39,14 +39,10 @@ _EXT = {
 }
 
 
-# --------------------------------------------------------------------------
-# Bounded in-RAM blob store. Evicts oldest by total byte count, not entry
-# count -- the thing PromptQueue.history gets wrong for large payloads.
-# --------------------------------------------------------------------------
 class BlobStore:
     def __init__(self, max_bytes):
         self.max_bytes = max_bytes
-        self._items = OrderedDict()  # id -> (bytes, content_type, created_wall)
+        self._items = OrderedDict()
         self._bytes = 0
         self._lock = threading.Lock()
 
@@ -55,7 +51,6 @@ class BlobStore:
         with self._lock:
             self._items[key] = (data, content_type, time.time())
             self._bytes += len(data)
-            # keep at least one entry so a single oversized result still shows
             while self._bytes > self.max_bytes and len(self._items) > 1:
                 _, evicted = self._items.popitem(last=False)
                 self._bytes -= len(evicted[0])
@@ -97,8 +92,6 @@ class BlobStore:
 STORE = BlobStore(MAX_STORE_BYTES)
 
 
-# All URLs below are relative to /inline_preview/ so the page works unchanged
-# behind a proxied path prefix (RunPod) as well as on a bare localhost tunnel.
 _GALLERY_HTML = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -149,11 +142,8 @@ const ago = s => s<60?Math.round(s)+'s ago'
   : s<3600?Math.round(s/60)+'m ago' : (s/3600).toFixed(1)+'h ago';
 const srcOf = it => '../inline_preview?id='+encodeURIComponent(it.id);
 
-// "keep in browser": pull each item into a Blob as it scrolls into view, then
-// render from an object URL. Survives the pod going away, for the life of this
-// tab. Lazy on purpose -- blobbing the whole store on open would pull GBs.
 let blobMode = true;
-const held = new Map();       // id -> object URL
+const held = new Map();
 let heldBytes = 0;
 let listing = {items:[],bytes:0,max_bytes:0};
 let io = null;
@@ -178,13 +168,13 @@ async function hydrate(card, it){
     const r = await fetch(srcOf(it), {cache:'no-store'});
     if(!r.ok) return;
     const b = await r.blob();
-    if(!blobMode || !card.isConnected) return;   // toggled off / reloaded mid-flight
+    if(!blobMode || !card.isConnected) return;
     const o = URL.createObjectURL(b);
     held.set(it.id, o); heldBytes += b.size;
     const m = card.querySelector('img,video'); if(m) m.src = o;
     const a = card.querySelector('a');         if(a) a.href = o;
     updateMeta();
-  }catch(e){ /* leave the direct URL in place */ }
+  }catch(e){}
 }
 
 async function load(){
@@ -221,7 +211,6 @@ async function load(){
     } else {
       media.loading = 'lazy';
     }
-    // In blob mode leave src empty so the only fetch is the one hydrate() makes.
     if(!blobMode) media.src = url;
 
     const row = document.createElement('div');
@@ -253,9 +242,6 @@ load();
 """
 
 
-# --------------------------------------------------------------------------
-# HTTP routes
-# --------------------------------------------------------------------------
 @PromptServer.instance.routes.get("/inline_preview")
 async def _inline_preview(request):
     key = request.rel_url.query.get("id", "")
@@ -296,9 +282,6 @@ async def _inline_preview_gallery(request):
                         headers={"Cache-Control": "no-store"})
 
 
-# --------------------------------------------------------------------------
-# helpers
-# --------------------------------------------------------------------------
 def _to_uint8(images):
     """IMAGE tensor [B,H,W,C] float 0..1 -> uint8 ndarray."""
     arr = images.cpu().numpy()
@@ -318,7 +301,6 @@ def _encode_still(arr_hwc, fmt, quality):
     return buf.getvalue(), "image/webp"
 
 
-# (av codec, container, mime, pix_fmt, encoder options)
 _VIDEO_CANDIDATES = [
     ("libx264", "mp4", "video/mp4", "yuv420p", {"crf": "20", "preset": "veryfast"}),
     ("libvpx-vp9", "webm", "video/webm", "yuv420p",
@@ -335,7 +317,7 @@ def _available_video_codecs():
     if _codec_cache is not None:
         return _codec_cache
     try:
-        import av  # noqa: F401
+        import av
     except ImportError:
         _codec_cache = []
         return _codec_cache
@@ -359,7 +341,7 @@ def _mux_audio(container, audio, container_fmt):
 
     wav = audio["waveform"]
     sr = int(audio["sample_rate"])
-    w = wav[0].cpu().numpy().astype(np.float32)  # [C, N]
+    w = wav[0].cpu().numpy().astype(np.float32)
     if w.shape[0] > 2:
         w = w[:2]
     channels = w.shape[0]
@@ -379,7 +361,6 @@ def _mux_audio(container, audio, container_fmt):
         if rf is not None:
             fifo.write(rf)
 
-    # encoders want an exact frame_size; opus sometimes reports 0
     fsize = getattr(astream, "frame_size", 0) or 960
     while True:
         chunk = fifo.read(fsize)
@@ -398,7 +379,6 @@ def _mux_audio(container, audio, container_fmt):
 def _encode_video(arr, fps, audio=None):
     import av
 
-    # yuv420p needs even dimensions
     h, w = arr.shape[1], arr.shape[2]
     h -= h % 2
     w -= w % 2
@@ -456,9 +436,6 @@ def _encode_animated_webp(arr, fps, quality):
     return buf.getvalue(), "image/webp"
 
 
-# --------------------------------------------------------------------------
-# nodes
-# --------------------------------------------------------------------------
 class PreviewImageInline:
     @classmethod
     def INPUT_TYPES(cls):
@@ -478,8 +455,6 @@ class PreviewImageInline:
 
     @classmethod
     def IS_CHANGED(cls, *args, **kwargs):
-        # Force re-execution so a cached run never replays an id the store has
-        # already evicted. Upstream nodes stay cached, so this is cheap.
         return float("nan")
 
     def preview(self, images, format="webp", quality=92):
@@ -523,8 +498,6 @@ class PreviewVideoInline:
         src_fps = None
 
         if video is not None:
-            # Re-encode from components rather than VideoInput.save_to(), which
-            # only takes a filesystem path -- that would defeat the whole point.
             comps = video.get_components()
             images = comps.images
             if audio is None:
@@ -554,7 +527,7 @@ class PreviewVideoInline:
 try:
     from . import history_redact
     history_redact.install()
-except Exception as e:  # never let this take the nodes down with it
+except Exception as e:
     log.error("inline_preview: history redaction could not be installed (%s). "
               "Prompts REMAIN readable via GET /history.", e)
 

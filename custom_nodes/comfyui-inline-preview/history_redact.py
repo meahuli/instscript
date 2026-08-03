@@ -25,11 +25,10 @@ log = logging.getLogger("inline_preview")
 
 ENABLED = os.environ.get("INLINE_PREVIEW_REDACT_HISTORY", "1") not in ("0", "false", "False")
 
-# task_done(self, item_id, history_result, status)
 _EXPECTED_PARAMS = ["self", "item_id", "history_result", "status"]
 
-_verified = False   # flipped once we've confirmed a real record came out blanked
-_broken = False     # latched on first verification failure, so we warn once
+_verified = False
+_broken = False
 
 
 def _redact_record(rec):
@@ -82,8 +81,6 @@ def install():
     def task_done(self, item_id, history_result, status=None):
         global _verified, _broken
 
-        # Read the prompt_id before the original runs -- task_done pops the
-        # entry out of currently_running.
         prompt_id = None
         try:
             with self.mutex:
@@ -109,7 +106,6 @@ def install():
                     ok = False
                 else:
                     ok = _redact_record(rec)
-                    # Verify against the stored object, not our local copy.
                     if ok:
                         ok = self.history[prompt_id]["prompt"][2] == {}
         except Exception as e:

@@ -1,21 +1,6 @@
 #!/usr/bin/env bash
-# ============================================================
-# cleanup-models.sh — delete downloaded model files (and symlinks) under
-# ComfyUI's models/ to free disk. Keeps the folder structure intact.
-#
-# Usage:
-#   bash cleanup-models.sh              # show sizes, then ask y/N
-#   bash cleanup-models.sh loras        # only empty models/loras
-#   FORCE=1 bash cleanup-models.sh       # skip the confirmation prompt
-#   DRYRUN=1 bash cleanup-models.sh      # just list what WOULD be deleted
-#
-# Scope: ONLY under <ComfyUI>/models. Does NOT touch comfyui_args.txt,
-# workflows, outputs, or anything outside models/.
-# ============================================================
 set -uo pipefail
 
-# --- locate ComfyUI across providers (runpod-slim, Vast, generic) ---
-# Override on any host with:  COMFY=/path/to/ComfyUI bash cleanup-models.sh
 if [ -z "${COMFY:-}" ]; then
   for c in /workspace/runpod-slim/ComfyUI /workspace/ComfyUI /opt/ComfyUI "${HOME:-/root}/ComfyUI" /ComfyUI; do
     [ -f "$c/main.py" ] && { COMFY="$c"; break; }

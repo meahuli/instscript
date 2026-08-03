@@ -1,26 +1,6 @@
 #!/usr/bin/env bash
-# ============================================================
-# provision.sh — install ComfyUI custom nodes on a fresh pod.
-# Works on BOTH:
-#   • RunPod runpod-slim  (ComfyUI /workspace/runpod-slim/ComfyUI, venv .venv-cu128)
-#   • Vast  vastai/comfyui (ComfyUI /workspace/ComfyUI,            venv /venv/main)
-# Auto-detects the ComfyUI dir + venv, installs the NODES below (protecting the
-# image's torch), and tells you how to reload ComfyUI for your provider.
-#
-# Usage (after the pod is up and ComfyUI has come up once):
-#   git clone https://github.com/meahuli/instscript.git /workspace/instscript 2>/dev/null \
-#     || git -C /workspace/instscript pull
-#   bash /workspace/instscript/provision.sh
-#   # Vast:   supervisorctl restart comfyui
-#   # RunPod: restart the pod
-#
-# ComfyUI launch ARGS:
-#   • Vast   -> set via the COMFYUI_ARGS env var in the template (this script does NOT touch them)
-#   • RunPod -> written to /workspace/runpod-slim/comfyui_args.txt by this script
-# ============================================================
-set -uo pipefail   # NOT -e: we handle per-node failures so one bad node won't abort everything
+set -uo pipefail
 
-# ---- Locate ComfyUI (RunPod runpod-slim, Vast, or generic) ----------------
 _find_comfy() {
   local c root
   if [ -n "${COMFY:-}" ]; then printf '%s\n' "$COMFY"; return 0; fi
@@ -41,7 +21,6 @@ if [ -z "$COMFY" ] || [ ! -d "$COMFY" ]; then
 fi
 echo "==> ComfyUI: $COMFY"
 
-# ---- Locate + activate the venv (Vast /venv/main, runpod-slim $COMFY/.venv-*) ----
 _find_venv() {
   local v
   if [ -n "${VIRTUAL_ENV:-}" ] && [ -f "$VIRTUAL_ENV/bin/activate" ]; then printf '%s\n' "$VIRTUAL_ENV"; return 0; fi
@@ -52,7 +31,6 @@ _find_venv() {
 }
 VENV="${VENV:-$(_find_venv || true)}"
 if [ -n "${VENV:-}" ] && [ -f "$VENV/bin/activate" ]; then
-  # shellcheck disable=SC1091
   source "$VENV/bin/activate"
   echo "==> venv: $VENV  ($(python --version 2>&1))"
 elif command -v python >/dev/null 2>&1; then
@@ -61,35 +39,23 @@ else
   echo "ERROR: no venv found and no python on PATH." >&2; exit 1
 fi
 
-# Installer: the vastai image uses uv; fall back to pip elsewhere.
 if command -v uv >/dev/null 2>&1; then PIP="uv pip"; else PIP="python -m pip"; fi
 echo "==> installer: $PIP"
 
-# ---- Provider (for args handling + restart hint) ----
 if [ -f /etc/supervisor/conf.d/comfyui.conf ] || [ -n "${CONTAINER_ID:-}" ]; then PROVIDER=vast
 elif [ -d /workspace/runpod-slim ]; then PROVIDER=runpod
 else PROVIDER=other; fi
 echo "==> provider: $PROVIDER"
 
-# Where this repo is checked out (used by the local-node + workflow deploys).
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# ============================================================
-# 1) CUSTOM NODES  —  EDIT THIS LIST to match your workflows.
-#    Append @<commit-sha> to a URL to pin it (recommended once it works).
-# ============================================================
 NODES=(
-  "https://github.com/city96/ComfyUI-GGUF"            # load GGUF-quantized models + GGUF text encoders
-  "https://github.com/Lightricks/ComfyUI-LTXVideo"    # LTX-2.x video nodes — needed by dl-ltx23.sh
-  "https://github.com/ClownsharkBatwing/RES4LYF"      # advanced samplers/guiders — LTX-2.3 workflow
-  "https://github.com/MadiatorLabs/ComfyUI-RunpodDirect" #Runpoddirect model downloader
-  # add more when you need them, e.g.:
-  # "https://github.com/Fannovel16/comfyui_controlnet_aux"
-  # "https://github.com/Gourieff/ComfyUI-ReActor"
-  # "https://github.com/balazik/ComfyUI-PuLID-Flux"   # Chroma/Flux PuLID
+  "https://github.com/city96/ComfyUI-GGUF"
+  "https://github.com/Lightricks/ComfyUI-LTXVideo"
+  "https://github.com/ClownsharkBatwing/RES4LYF"
+  "https://github.com/MadiatorLabs/ComfyUI-RunpodDirect"
 )
 
-# Protect the image's torch from being clobbered by a node's requirements.
 CONSTRAINTS="/tmp/torch-constraints.txt"
 python - > "$CONSTRAINTS" 2>/dev/null <<'PY' || true
 import importlib.metadata as m
@@ -123,18 +89,9 @@ for repo_spec in "${NODES[@]}"; do
   fi
 done
 
-# --- Pin deps that ComfyUI-LTXVideo leaves unbounded (its requirements.txt has no
-#     upper bound, so a fresh install grabs incompatible 'latest' and shows IMPORT FAILED):
-#       transformers 5.x removed APIs the node imports;
-#       latest kornia dropped 'pad' from kornia.geometry.transform.pyramid.
-#     0.7.4 still exports pad + the pyramid helpers; transformers 4.5x is fine.
 $PIP install "transformers[timm]>=4.50.0,<5" "kornia==0.7.4" -c "$CONSTRAINTS" \
   || echo "   LTX dep-pin FAILED — run manually: pip install 'transformers[timm]<5' 'kornia==0.7.4'"
 
-# --- Local custom nodes shipped inside this repo (custom_nodes/*) ----------
-#     Copied, not symlinked: ComfyUI resolves WEB_DIRECTORY against the real
-#     path, and a symlink into this clone breaks if the clone moves. Copying
-#     also means these overwrite cleanly on every re-run.
 if [ -d "$SELF_DIR/custom_nodes" ]; then
   for d in "$SELF_DIR"/custom_nodes/*/; do
     [ -d "$d" ] || continue
@@ -150,17 +107,6 @@ if [ -d "$SELF_DIR/custom_nodes" ]; then
   done
 fi
 
-# ============================================================
-# 2) WORKFLOWS — copy any *.json sitting next to this script into ComfyUI's
-#    workflows dir so they appear in the Workflows sidebar (ComfyUI only scans
-#    that folder; JSONs anywhere else are invisible to the UI).
-#
-#    The workflow JSONs no longer ship in this repo — they are kept outside it.
-#    To get them onto a pod, either drop them beside provision.sh before running
-#    it, or copy them straight to the dir below afterwards:
-#       cp /workspace/workflows/*.json "$COMFY/user/default/workflows/"
-#    This step is a no-op when there is nothing beside the script.
-# ============================================================
 WF_DIR="$COMFY/user/default/workflows"
 mkdir -p "$WF_DIR"
 if ls "$SELF_DIR"/*.json >/dev/null 2>&1; then
@@ -171,22 +117,7 @@ else
   echo "==> no workflow JSONs next to provision.sh — skipping sidebar deploy"
 fi
 
-# ============================================================
-# 3) MODELS — the dl-*.sh scripts no longer live in this repo; they are kept
-#    outside it alongside model-lib.sh, which every one of them sources from
-#    its own directory. Copy that folder onto the pod and run whichever you
-#    need AFTER this script, keeping model-lib.sh next to them, e.g.:
-#       bash /workspace/dlscripts/dl-chroma.sh
-#       MODE=i2v bash /workspace/dlscripts/dl-wan.sh
-#       PRECISION=bf16 bash /workspace/dlscripts/dl-ltx23.sh
-#    Each is resumable and skips files already present (model-lib auto-detects ComfyUI).
-# ============================================================
 
-# ============================================================
-# 4) COMFYUI ARGS
-#    RunPod runpod-slim -> written to comfyui_args.txt (read on restart).
-#    Vast / other       -> args come from the COMFYUI_ARGS env var (template); not written here.
-# ============================================================
 if [ "$PROVIDER" = "runpod" ]; then
   ARGS_FILE="/workspace/runpod-slim/comfyui_args.txt"
   cat > "$ARGS_FILE" <<'EOF'
