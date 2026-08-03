@@ -71,6 +71,9 @@ elif [ -d /workspace/runpod-slim ]; then PROVIDER=runpod
 else PROVIDER=other; fi
 echo "==> provider: $PROVIDER"
 
+# Where this repo is checked out (used by the local-node + workflow deploys).
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 # ============================================================
 # 1) CUSTOM NODES  —  EDIT THIS LIST to match your workflows.
 #    Append @<commit-sha> to a URL to pin it (recommended once it works).
@@ -128,13 +131,31 @@ done
 $PIP install "transformers[timm]>=4.50.0,<5" "kornia==0.7.4" -c "$CONSTRAINTS" \
   || echo "   LTX dep-pin FAILED — run manually: pip install 'transformers[timm]<5' 'kornia==0.7.4'"
 
+# --- Local custom nodes shipped inside this repo (custom_nodes/*) ----------
+#     Copied, not symlinked: ComfyUI resolves WEB_DIRECTORY against the real
+#     path, and a symlink into this clone breaks if the clone moves. Copying
+#     also means these overwrite cleanly on every re-run.
+if [ -d "$SELF_DIR/custom_nodes" ]; then
+  for d in "$SELF_DIR"/custom_nodes/*/; do
+    [ -d "$d" ] || continue
+    n=$(basename "$d")
+    echo "==> [$n] installing local node"
+    rm -rf "${COMFY:?}/custom_nodes/$n"
+    cp -r "$d" "$COMFY/custom_nodes/$n"
+    rm -rf "$COMFY/custom_nodes/$n/__pycache__"
+    if [ -f "$COMFY/custom_nodes/$n/requirements.txt" ]; then
+      $PIP install -r "$COMFY/custom_nodes/$n/requirements.txt" -c "$CONSTRAINTS" \
+        || echo "   DEP INSTALL FAILED for $n"
+    fi
+  done
+fi
+
 # ============================================================
 # 2) WORKFLOWS — copy the *.json bundled in this repo into ComfyUI's workflows
 #    dir so they appear in the Workflows sidebar (ComfyUI only scans that folder;
 #    files sitting in this repo dir are otherwise invisible to the UI).
 # ============================================================
 WF_DIR="$COMFY/user/default/workflows"
-SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$WF_DIR"
 if ls "$SELF_DIR"/*.json >/dev/null 2>&1; then
   cp -f "$SELF_DIR"/*.json "$WF_DIR/"
