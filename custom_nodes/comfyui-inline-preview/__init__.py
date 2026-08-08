@@ -126,6 +126,22 @@ def _live_key():
     return None
 
 
+def _key_sweeper():
+    """_live_key() only runs when something encrypts, so on its own the key
+    would sit in RAM untouched for exactly as long as the pod is idle -- which
+    is the case the TTL exists for. This is what actually scrubs it."""
+    interval = max(5, min(30, KEY_TTL // 2))
+    while True:
+        time.sleep(interval)
+        try:
+            with _key_lock:
+                idle = _session_key is not None and time.time() - _key_touched > KEY_TTL
+            if idle and not _queue_busy():
+                forget_key("idle %ds" % KEY_TTL)
+        except Exception:
+            pass
+
+
 def _encrypt(data):
     """-> (blob, kid). AES-GCM with a fresh 96-bit nonce per blob, prepended.
     Distinct nonces under one key are what keeps GCM safe across many blobs."""
@@ -913,6 +929,13 @@ class PreviewVideoInline:
              "frames": int(arr.shape[0]), "fps": round(rate, 3)}
         ]}}
 
+
+if KEY_TTL:
+    threading.Thread(target=_key_sweeper, daemon=True,
+                     name="inline_preview_key_sweeper").start()
+else:
+    log.warning("inline_preview: INLINE_PREVIEW_KEY_TTL=0 -- the encryption key "
+                "stays in RAM for the life of the process once posted")
 
 if not TOKEN:
     log.warning("inline_preview: INLINE_PREVIEW_TOKEN is empty -- /inline_preview/list "
