@@ -153,12 +153,32 @@ def _key_sweeper():
             pass
 
 
+_warned = set()
+
+
+def _warn_once(tag, msg):
+    if tag not in _warned:
+        _warned.add(tag)
+        log.warning(msg)
+
+
 def _encrypt(data):
     """-> (blob, kid). AES-GCM with a fresh 96-bit nonce per blob, prepended.
     Distinct nonces under one key are what keeps GCM safe across many blobs."""
     global _key_touched
+    if AESGCM is None:
+        _warn_once("nocrypto",
+                   "inline_preview: cryptography is not installed, so previews are stored "
+                   "UNENCRYPTED (the password still gates them). Re-run provision.sh, or "
+                   "pip install cryptography, and restart.")
+        return data, ""
     live = _live_key()
-    if live is None or AESGCM is None:
+    if live is None:
+        _warn_once("nokey",
+                   "inline_preview: no session key has been posted, so previews are stored "
+                   "UNENCRYPTED (the password still gates them). Unlock the gallery once in "
+                   "the browser running ComfyUI -- POST /inline_preview/key needs the password, "
+                   "so a locked tab cannot hand its key over.")
         return data, ""
     key, kid = live
     with _key_lock:
@@ -640,6 +660,7 @@ async def _inline_preview_key(request):
         _key_touched = time.time()
         kid = _session_kid
     if fresh:
+        _warned.discard("nokey")   # so a later lapse warns again rather than staying quiet
         log.info("inline_preview: session key set (kid %s) -- new previews are encrypted", kid)
     return web.json_response({"ok": True, "kid": kid, "ttl": KEY_TTL})
 
