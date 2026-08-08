@@ -46,10 +46,10 @@ class BlobStore:
         self._bytes = 0
         self._lock = threading.Lock()
 
-    def put(self, data, content_type):
+    def put(self, data, content_type, has_audio=False):
         key = uuid.uuid4().hex
         with self._lock:
-            self._items[key] = (data, content_type, time.time())
+            self._items[key] = (data, content_type, time.time(), has_audio)
             self._bytes += len(data)
             while self._bytes > self.max_bytes and len(self._items) > 1:
                 _, evicted = self._items.popitem(last=False)
@@ -69,7 +69,8 @@ class BlobStore:
         now = time.time()
         with self._lock:
             items = [
-                {"id": k, "type": v[1], "bytes": len(v[0]), "age": round(now - v[2], 1)}
+                {"id": k, "type": v[1], "bytes": len(v[0]), "age": round(now - v[2], 1),
+                 "audio": v[3]}
                 for k, v in self._items.items()
             ]
         items.reverse()
@@ -206,7 +207,7 @@ async function load(){
 
     const media = document.createElement(it.type.startsWith('video/')?'video':'img');
     if(media.tagName === 'VIDEO'){
-      media.controls = true; media.loop = true; media.muted = true;
+      media.controls = true; media.loop = true; media.muted = !it.audio;
       media.playsInline = true; media.preload = 'none';
     } else {
       media.loading = 'lazy';
@@ -248,7 +249,7 @@ async def _inline_preview(request):
     item = STORE.get(key)
     if item is None:
         return web.Response(status=404, text="expired: evicted from the RAM store")
-    data, content_type, _created = item
+    data, content_type = item[0], item[1]
     return web.Response(
         body=data,
         content_type=content_type,
@@ -335,54 +336,93 @@ def _available_video_codecs():
     return ok
 
 
-def _mux_audio(container, audio, container_fmt):
-    """Best-effort. Any PyAV quirk here degrades to a silent video."""
+_AAC_RATES = (96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
+              16000, 12000, 11025, 8000, 7350)
+
+_AUDIO_CANDIDATES = {"mp4": ("aac",), "webm": ("libopus", "libvorbis")}
+
+
+def _waveform(audio):
+    """ComfyUI AUDIO -> (float32 [channels, samples], sample_rate, layout), or None."""
+    wav = audio.get("waveform") if isinstance(audio, dict) else None
+    if wav is None:
+        return None
+    if hasattr(wav, "cpu"):
+        wav = wav.cpu().numpy()
+    wav = np.asarray(wav, dtype=np.float32)
+
+    if wav.ndim == 3:
+        wav = wav[0]
+    elif wav.ndim == 1:
+        wav = wav[None, :]
+    if wav.ndim != 2 or wav.shape[1] == 0:
+        return None
+    if wav.shape[0] > 2:
+        wav = wav[:2]
+
+    layout = "mono" if wav.shape[0] == 1 else "stereo"
+    return np.ascontiguousarray(wav), int(audio["sample_rate"]), layout
+
+
+def _add_audio_stream(container, container_fmt, sample_rate, layout):
+    """Must run BEFORE the first mux(): the header carries the stream table, and
+    PyAV refuses add_stream() once encoding has started."""
     import av
 
-    wav = audio["waveform"]
-    sr = int(audio["sample_rate"])
-    w = wav[0].cpu().numpy().astype(np.float32)
-    if w.shape[0] > 2:
-        w = w[:2]
-    channels = w.shape[0]
-    layout = "mono" if channels == 1 else "stereo"
+    for name in _AUDIO_CANDIDATES.get(container_fmt, ()):
+        try:
+            av.codec.Codec(name, "w")
+        except Exception:
+            continue
+        rate = sample_rate
+        if name == "libopus":
+            rate = 48000
+        elif name == "aac" and sample_rate not in _AAC_RATES:
+            rate = 48000
+        try:
+            astream = container.add_stream(name, rate=rate)
+            try:
+                astream.codec_context.layout = layout
+            except Exception:
+                astream.layout = layout
+            return astream
+        except Exception as e:
+            log.warning("inline_preview: audio encoder %s unusable: %s", name, e)
+    return None
 
-    codec = "libopus" if container_fmt == "webm" else "aac"
-    out_sr = 48000 if codec == "libopus" else sr
-    astream = container.add_stream(codec, rate=out_sr)
 
-    frame = av.AudioFrame.from_ndarray(np.ascontiguousarray(w), format="fltp", layout=layout)
-    frame.sample_rate = sr
-    frame.time_base = Fraction(1, sr)
+def _encode_audio(container, astream, wav, sample_rate, layout):
+    """One frame in; PyAV's encoder resamples to the codec's format/rate and
+    re-chunks to its frame_size on its own, provided pts is set."""
+    import av
 
-    resampler = av.audio.resampler.AudioResampler(format="fltp", layout=layout, rate=out_sr)
-    fifo = av.audio.fifo.AudioFifo()
-    for rf in resampler.resample(frame):
-        if rf is not None:
-            fifo.write(rf)
+    frame = av.AudioFrame.from_ndarray(wav, format="fltp", layout=layout)
+    frame.sample_rate = sample_rate
+    frame.time_base = Fraction(1, sample_rate)
+    frame.pts = 0
 
-    fsize = getattr(astream, "frame_size", 0) or 960
-    while True:
-        chunk = fifo.read(fsize)
-        if chunk is None:
-            break
-        for p in astream.encode(chunk):
-            container.mux(p)
-    tail = fifo.read()
-    if tail is not None:
-        for p in astream.encode(tail):
-            container.mux(p)
+    for p in astream.encode(frame):
+        container.mux(p)
     for p in astream.encode():
         container.mux(p)
 
 
 def _encode_video(arr, fps, audio=None):
+    """-> (bytes, mime, has_audio). has_audio is False whenever the clip came
+    out silent, so the browser knows not to open it muted."""
     import av
 
     h, w = arr.shape[1], arr.shape[2]
     h -= h % 2
     w -= w % 2
     arr = arr[:, :h, :w, :]
+
+    track = None
+    if audio is not None:
+        try:
+            track = _waveform(audio)
+        except Exception as e:
+            log.warning("inline_preview: unreadable AUDIO input (%s) -- silent video", e)
 
     rate = Fraction(fps).limit_denominator(1000)
     last_err = None
@@ -396,6 +436,12 @@ def _encode_video(arr, fps, audio=None):
             stream.pix_fmt = pix_fmt
             stream.options = opts
 
+            astream = None
+            if track is not None:
+                astream = _add_audio_stream(container, fmt, track[1], track[2])
+                if astream is None:
+                    log.warning("inline_preview: no audio encoder for .%s -- silent video", fmt)
+
             for f in arr:
                 frame = av.VideoFrame.from_ndarray(f, format="rgb24")
                 for p in stream.encode(frame):
@@ -403,21 +449,23 @@ def _encode_video(arr, fps, audio=None):
             for p in stream.encode():
                 container.mux(p)
 
-            if audio is not None:
+            has_audio = False
+            if astream is not None:
                 try:
-                    _mux_audio(container, audio, fmt)
+                    _encode_audio(container, astream, *track)
+                    has_audio = True
                 except Exception as e:
-                    log.warning("inline_preview: audio mux failed (%s) -- silent video", e)
+                    log.warning("inline_preview: audio encode failed (%s) -- silent video", e)
 
             container.close()
-            return buf.getvalue(), mime
+            return buf.getvalue(), mime, has_audio
         except Exception as e:
             last_err = e
             log.warning("inline_preview: encoder %s failed: %s", name, e)
 
     if last_err is not None:
         log.warning("inline_preview: all video encoders failed, using animated WebP")
-    return None, None
+    return None, None, False
 
 
 def _encode_animated_webp(arr, fps, quality):
@@ -514,13 +562,16 @@ class PreviewVideoInline:
         if arr.shape[0] == 0:
             return {"ui": {"inline": []}}
 
-        data, mime = _encode_video(arr, rate, audio)
+        data, mime, has_audio = _encode_video(arr, rate, audio)
         if data is None:
+            if audio is not None:
+                log.warning("inline_preview: the animated-WebP fallback cannot carry audio")
             data, mime = _encode_animated_webp(arr, rate, quality)
+            has_audio = False
 
         return {"ui": {"inline": [
-            {"id": STORE.put(data, mime), "type": mime, "bytes": len(data),
-             "frames": int(arr.shape[0]), "fps": round(rate, 3)}
+            {"id": STORE.put(data, mime, has_audio), "type": mime, "bytes": len(data),
+             "audio": has_audio, "frames": int(arr.shape[0]), "fps": round(rate, 3)}
         ]}}
 
 

@@ -66,9 +66,21 @@ async function hydrate(node, item, wrap) {
     media = document.createElement("video");
     media.controls = true;
     media.loop = true;
-    media.muted = true;
-    media.autoplay = true;
     media.playsInline = true;
+    if (item.audio) {
+      // Unmuted autoplay is only allowed once the page has media engagement, so
+      // ask for sound and drop back to a muted autoplay if the browser refuses.
+      media.muted = false;
+      media.addEventListener("loadeddata", () => {
+        media.play().catch(() => {
+          media.muted = true;
+          media.play().catch(() => {});
+        });
+      }, { once: true });
+    } else {
+      media.muted = true;
+      media.autoplay = true;
+    }
   } else {
     media = document.createElement("img");
   }
