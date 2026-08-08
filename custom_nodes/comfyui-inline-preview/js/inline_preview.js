@@ -42,8 +42,8 @@ async function kidOf(raw) {
   return [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
 }
 
-async function publishKey() {
-  if (keyPublished) return;
+async function publishKey(force) {
+  if (keyPublished && !force) return;
   const raw = sessionKey();
   if (!raw) return;
   try {
@@ -53,7 +53,21 @@ async function publishKey() {
       body: JSON.stringify({ key: b64(raw) }),
     });
     keyPublished = r.ok;   // 403 until this browser is unlocked; retried later
+    if (!r.ok) console.warn("inline_preview: key not accepted — previews will be unencrypted");
   } catch (e) {}
+}
+
+// The server drops the key once the pod is idle, so re-establish it on the way
+// into every queue. Without this the first run after a lull stores plaintext.
+function hookQueue() {
+  const orig = api?.queuePrompt;
+  if (typeof orig !== "function" || orig._inlinePreviewHooked) return;
+  const patched = async function (...args) {
+    try { await publishKey(true); } catch (e) {}
+    return orig.apply(api, args);
+  };
+  patched._inlinePreviewHooked = true;
+  api.queuePrompt = patched;
 }
 
 async function decryptBlob(buf, item) {
@@ -190,6 +204,7 @@ app.registerExtension({
   name: "inline.preview.ram",
 
   async setup() {
+    hookQueue();
     publishKey();
   },
 

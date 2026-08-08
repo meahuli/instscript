@@ -14,6 +14,9 @@ Password:    INLINE_PREVIEW_TOKEN      env var. The gallery prompts for it and
              remembers the answer in a cookie. Unset = random per boot (logged
              at startup, so paste it once); empty = no password at all.
 CORS:        INLINE_PREVIEW_ALLOW_ORIGIN  env var (default: same-origin only)
+Key TTL:     INLINE_PREVIEW_KEY_TTL    seconds the browser's encryption key may
+             sit in RAM unused before it is scrubbed (default 300, 0 = forever).
+             The browser re-posts it on the way into every queue.
 """
 
 import io
@@ -54,25 +57,66 @@ try:
 except ImportError:
     AESGCM = None
 
-# Posted once per browser session over an authenticated route, never served
-# back, never written anywhere. No key -> blobs are stored as-is and the
-# password is the only thing in front of them.
-_session_key = None
+# Posted over an authenticated route, never served back, never written anywhere,
+# and dropped once the pod goes idle -- the browser re-posts before each queue.
+# No key -> blobs are stored as-is and the password is the only thing in front.
+KEY_TTL = int(os.environ.get("INLINE_PREVIEW_KEY_TTL", "300"))
+
+_session_key = None      # bytearray, so the long-lived copy can be overwritten
 _session_kid = ""
+_key_touched = 0.0
+_key_lock = threading.Lock()
 
 
 def _kid(key):
-    return hashlib.sha256(key).hexdigest()[:16]
+    return hashlib.sha256(bytes(key)).hexdigest()[:16]
+
+
+def _zero_locked():
+    """Caller holds _key_lock. Only scrubs the copy we own -- the transient
+    bytes handed to OpenSSL, and whatever the JSON parser made of the request
+    body, are immutable and left to the GC. Nothing here is mlock'd either."""
+    global _session_key, _session_kid
+    if _session_key is not None:
+        for i in range(len(_session_key)):
+            _session_key[i] = 0
+    _session_key = None
+    _session_kid = ""
+
+
+def forget_key(why):
+    with _key_lock:
+        had = _session_key is not None
+        _zero_locked()
+    if had:
+        log.info("inline_preview: session key forgotten (%s)", why)
+
+
+def _live_key():
+    """None once the TTL lapses, so a pod nobody is using holds no key at all."""
+    with _key_lock:
+        if _session_key is None:
+            return None
+        if KEY_TTL and time.time() - _key_touched > KEY_TTL:
+            _zero_locked()
+        else:
+            return bytes(_session_key), _session_kid
+    log.info("inline_preview: session key expired after %ds idle", KEY_TTL)
+    return None
 
 
 def _encrypt(data):
     """-> (blob, kid). AES-GCM with a fresh 96-bit nonce per blob, prepended.
     Distinct nonces under one key are what keeps GCM safe across many blobs."""
-    key = _session_key
-    if key is None or AESGCM is None:
+    global _key_touched
+    live = _live_key()
+    if live is None or AESGCM is None:
         return data, ""
+    key, kid = live
+    with _key_lock:
+        _key_touched = time.time()
     nonce = os.urandom(12)
-    return nonce + AESGCM(key).encrypt(nonce, data, None), _session_kid
+    return nonce + AESGCM(key).encrypt(nonce, data, None), kid
 
 _EXT = {
     "image/png": ".png",
@@ -459,7 +503,7 @@ def _with_cookie(resp):
 async def _inline_preview_key(request):
     """Take the browser's session key. Authenticated, so the password is what
     stops anyone else from swapping the key out from under you."""
-    global _session_key, _session_kid
+    global _session_key, _session_kid, _key_touched
     deny = _guard(request)
     if deny is not None:
         return deny
@@ -471,12 +515,18 @@ async def _inline_preview_key(request):
         raw = b""
     if len(raw) != 32:
         return web.json_response({"ok": False, "reason": "bad-key"}, status=400)
-    if raw != _session_key:
-        _session_key = raw
-        _session_kid = _kid(raw)
-        log.info("inline_preview: session key set (kid %s) -- new previews are encrypted",
-                 _session_kid)
-    return web.json_response({"ok": True, "kid": _session_kid})
+
+    with _key_lock:
+        fresh = _session_key is None or bytes(_session_key) != raw
+        if fresh:
+            _zero_locked()
+            _session_key = bytearray(raw)
+            _session_kid = _kid(raw)
+        _key_touched = time.time()
+        kid = _session_kid
+    if fresh:
+        log.info("inline_preview: session key set (kid %s) -- new previews are encrypted", kid)
+    return web.json_response({"ok": True, "kid": kid, "ttl": KEY_TTL})
 
 
 @PromptServer.instance.routes.get("/inline_preview")
@@ -524,6 +574,9 @@ async def _inline_preview_clear(request):
     if deny is not None:
         return deny
     STORE.clear()
+    # "clear all" means all of it -- otherwise the key outlives every blob it
+    # was ever used on. The browser re-posts before the next queue.
+    forget_key("store cleared")
     return web.json_response(STORE.stats())
 
 
