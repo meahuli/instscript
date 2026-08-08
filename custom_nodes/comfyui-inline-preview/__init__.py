@@ -14,9 +14,12 @@ Password:    INLINE_PREVIEW_TOKEN      env var. The gallery prompts for it and
              remembers the answer in a cookie. Unset = random per boot (logged
              at startup, so paste it once); empty = no password at all.
 CORS:        INLINE_PREVIEW_ALLOW_ORIGIN  env var (default: same-origin only)
-Key TTL:     INLINE_PREVIEW_KEY_TTL    seconds the browser's encryption key may
-             sit in RAM unused before it is scrubbed (default 300, 0 = forever).
-             The browser re-posts it on the way into every queue.
+Key TTL:     INLINE_PREVIEW_KEY_TTL    seconds the pod may sit IDLE -- queue
+             drained -- before the browser's encryption key is scrubbed
+             (default 300, 0 = never). It does not have to cover how long a
+             generation takes: the key is held while there is work in flight,
+             and the browser re-posts it on the way into every queue. Lower is
+             tighter; 60 is reasonable.
 """
 
 import io
