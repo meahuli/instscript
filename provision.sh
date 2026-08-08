@@ -1,6 +1,68 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Which revision the pod provisions from. The nodes under custom_nodes/ are
+# installed by copying out of SELF_DIR, not by cloning, so this is the only
+# thing that decides which version of them reaches the pod.
+#
+#   bash provision.sh                      -> PROVISION_REF_DEFAULT below
+#   PROVISION_REF=other bash provision.sh  -> that branch, tag or sha
+#   PROVISION_REF= bash provision.sh       -> no switch, use what is checked out
+#
+# !! MOVE THIS BACK TO main WHEN inline-preview-pke MERGES. Until then every
+# !! provision is pulled onto the feature branch on purpose. Once it is merged
+# !! this default is actively wrong, and once the branch is deleted it resolves
+# !! to nothing -- which is why an unresolvable DEFAULT only warns and carries
+# !! on, while a ref you asked for explicitly is a hard failure.
+PROVISION_REF_DEFAULT="inline-preview-pke"
+
+if [ -z "${PROVISION_REF+isset}" ]; then
+  PROVISION_REF="$PROVISION_REF_DEFAULT"; PROVISION_REF_SOFT=1
+else
+  PROVISION_REF_SOFT=""
+fi
+
+# Done first and followed by a re-exec, because bash reads a script
+# incrementally: checking out a different version of the file we are currently
+# executing can drop the running shell into the middle of unrelated text.
+# PROVISION_REF_DONE stops the re-exec looping if the ref we land on is older
+# than this block.
+if [ -n "${PROVISION_REF:-}" ] && [ -z "${PROVISION_REF_DONE:-}" ]; then
+  _ref_at() { git -C "$SELF_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown; }
+  _ref_bail() {
+    if [ -n "$PROVISION_REF_SOFT" ]; then
+      echo "!!  $1" >&2
+      echo "!!  staying on $(_ref_at) — set PROVISION_REF explicitly to override." >&2
+    else
+      echo "ERROR: $1" >&2; exit 1
+    fi
+  }
+  if [ ! -d "$SELF_DIR/.git" ]; then
+    [ -n "$PROVISION_REF_SOFT" ] \
+      || echo "!!  PROVISION_REF=$PROVISION_REF ignored — $SELF_DIR is not a git checkout." >&2
+  elif [ -n "$(git -C "$SELF_DIR" status --porcelain 2>/dev/null)" ]; then
+    _ref_bail "$SELF_DIR has uncommitted changes — refusing to switch to $PROVISION_REF."
+  elif [ "$(_ref_at)" = "$PROVISION_REF" ]; then
+    # Already there. Deliberately no fetch and no checkout -B: re-resetting the
+    # branch on every single provision would discard anything committed here,
+    # and updating is the bootstrap's job (clone || pull), not this block's.
+    echo "==> provision on $PROVISION_REF ($(git -C "$SELF_DIR" rev-parse --short HEAD))"
+  else
+    echo "==> switching provision checkout to $PROVISION_REF"
+    git -C "$SELF_DIR" fetch -q origin || echo "   FETCH FAILED — trying what is already local"
+    if git -C "$SELF_DIR" checkout -q -B "$PROVISION_REF" "origin/$PROVISION_REF" 2>/dev/null \
+       || git -C "$SELF_DIR" checkout -q "$PROVISION_REF" 2>/dev/null; then
+      echo "==> provision now at $(git -C "$SELF_DIR" rev-parse --short HEAD) ($PROVISION_REF)"
+      export PROVISION_REF_DONE=1
+      exec bash "$0" "$@"
+    else
+      _ref_bail "cannot check out $PROVISION_REF"
+    fi
+  fi
+fi
+
 _find_comfy() {
   local c root
   if [ -n "${COMFY:-}" ]; then printf '%s\n' "$COMFY"; return 0; fi
@@ -46,8 +108,6 @@ if [ -f /etc/supervisor/conf.d/comfyui.conf ] || [ -n "${CONTAINER_ID:-}" ]; the
 elif [ -d /workspace/runpod-slim ]; then PROVIDER=runpod
 else PROVIDER=other; fi
 echo "==> provider: $PROVIDER"
-
-SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Pinned at 2026-08-08. These run in-process with full access to prompts, images
 # and the encryption key, so an unpinned clone means whatever landed on their
@@ -116,6 +176,13 @@ $PIP install "transformers[timm]>=4.50.0,<5" "kornia==0.7.4" -c "$CONSTRAINTS" \
   || echo "   LTX dep-pin FAILED — run manually: pip install 'transformers[timm]<5' 'kornia==0.7.4'"
 
 if [ -d "$SELF_DIR/custom_nodes" ]; then
+  # Say which revision these came from. They are copied out of this checkout, so
+  # "why is the pod running old code" is always answered by this line.
+  if [ -d "$SELF_DIR/.git" ]; then
+    echo "==> local nodes from $(git -C "$SELF_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)@$(git -C "$SELF_DIR" rev-parse --short HEAD 2>/dev/null)"
+  else
+    echo "==> local nodes from $SELF_DIR (not a git checkout — cannot report a revision)"
+  fi
   for d in "$SELF_DIR"/custom_nodes/*/; do
     [ -d "$d" ] || continue
     n=$(basename "$d")

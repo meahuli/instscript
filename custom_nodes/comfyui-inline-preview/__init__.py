@@ -9,17 +9,36 @@ Results are encoded in-process and held in a byte-capped LRU dict. The node's
 Nothing is ever written to disk, tmpfs, or anywhere else. ComfyUI never calls
 open() for these results.
 
+The two directions are encrypted differently, because they need different
+things:
+
+  outputs  sealed to the browser's PUBLIC key. Each preview gets a one-time
+           AES-256 key, wrapped to that public key and carried inside the blob.
+           The pod holds no private half, so nothing resident here opens what is
+           already in the store.
+  uploads  symmetric, and the pod does hold the key -- unavoidably, because the
+           graph needs a tensor and only this process can produce one. Keys are
+           per-browser, looked up by the kid the blob names, held while work is
+           in flight and scrubbed once the pod goes idle.
+
+Neither covers the moment of generation: the plaintext preview, the decoded
+upload and the prompt all exist in this address space while a graph runs, and
+Python cannot scrub any of it. What the split buys is that a snapshot taken
+BETWEEN runs finds no way into the stored previews.
+
 Store size:  INLINE_PREVIEW_MAX_MB     env var (default 2048)
 Password:    INLINE_PREVIEW_TOKEN      env var. The gallery prompts for it and
              remembers the answer in a cookie. Unset = random per boot (logged
              at startup, so paste it once); empty = no password at all.
 CORS:        INLINE_PREVIEW_ALLOW_ORIGIN  env var (default: same-origin only)
 Key TTL:     INLINE_PREVIEW_KEY_TTL    seconds the pod may sit IDLE -- queue
-             drained -- before the browser's encryption key is scrubbed
-             (default 300, 0 = never). It does not have to cover how long a
-             generation takes: the key is held while there is work in flight,
-             and the browser re-posts it on the way into every queue. Lower is
-             tighter; 60 is reasonable.
+             drained -- before a browser's upload key is scrubbed (default 300).
+             It does not have to cover how long a generation takes: keys are
+             held while there is work in flight, and the browser re-posts on the
+             way into every queue. Lower is tighter; 1 is the tightest useful
+             value, since the sweeper floors its interval at 5s.
+             NOTE 0 means NEVER SCRUBBED, not "scrub immediately" -- it pins
+             every posted key in RAM for the life of the process.
 """
 
 import io
@@ -69,42 +88,62 @@ _fails = 0
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+    from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 except ImportError:
     AESGCM = None
+    RSAPublicKey = None
 
-# Posted over an authenticated route, never served back, never written anywhere,
-# and dropped once the pod goes idle -- the browser re-posts before each queue.
-# No key -> blobs are stored as-is and the password is the only thing in front.
+# ------------------------------------------------------------ upload keys --
+# Symmetric, and UPLOADS ONLY: the graph needs a tensor, so an uploaded image
+# has to come back in the clear here, which means the pod must hold the key that
+# opens it. Outputs do not go through this at all -- see the public-key section
+# below. Posted over an authenticated route, never served back, never written
+# anywhere, and dropped once the pod goes idle; the browser re-posts before each
+# queue. No key -> the upload is stored as-is and the password is all that is
+# in front of it.
 KEY_TTL = int(os.environ.get("INLINE_PREVIEW_KEY_TTL", "300"))
 
-_session_key = None      # bytearray, so the long-lived copy can be overwritten
-_session_kid = ""
-_key_touched = 0.0
+# Held per-kid rather than in one global slot. Two browsers -- or a normal
+# window and an incognito one, which have separate localStorage -- each post
+# their own, and a graph decrypting an upload needs back the exact key that
+# upload was sealed with. With a single slot, whichever browser posted last
+# silently broke the other one's run, and `status` is broadcast to every tab so
+# they traded the slot on every socket tick.
+_keys = {}               # kid -> [bytearray key, float touched]
 _key_lock = threading.Lock()
+
+# Nothing but the password gates POST /inline_preview/key, so bound what a
+# client that keeps posting fresh keys can make us hold.
+MAX_KEYS = 8
 
 
 def _kid(key):
     return hashlib.sha256(bytes(key)).hexdigest()[:16]
 
 
-def _zero_locked():
-    """Caller holds _key_lock. Only scrubs the copy we own -- the transient
-    bytes handed to OpenSSL, and whatever the JSON parser made of the request
-    body, are immutable and left to the GC. Nothing here is mlock'd either."""
-    global _session_key, _session_kid
-    if _session_key is not None:
-        for i in range(len(_session_key)):
-            _session_key[i] = 0
-    _session_key = None
-    _session_kid = ""
+def _zero_locked(kid=None):
+    """Caller holds _key_lock; kid=None means all of them. Only scrubs the
+    copies we own -- the transient bytes handed to OpenSSL, and whatever the
+    JSON parser made of the request body, are immutable and left to the GC.
+    Nothing here is mlock'd either."""
+    for k in ([kid] if kid is not None else list(_keys)):
+        entry = _keys.pop(k, None)
+        if entry is None:
+            continue
+        buf = entry[0]
+        for i in range(len(buf)):
+            buf[i] = 0
 
 
-def forget_key(why):
+def forget_key(why, kid=None):
     with _key_lock:
-        had = _session_key is not None
-        _zero_locked()
+        had = kid in _keys if kid is not None else bool(_keys)
+        _zero_locked(kid)
     if had:
-        log.info("inline_preview: session key forgotten (%s)", why)
+        log.info("inline_preview: session key %s forgotten (%s)",
+                 kid[:8] if kid else "(all)", why)
 
 
 def _queue_busy():
@@ -117,41 +156,92 @@ def _queue_busy():
         return True   # unsure -> keep the key rather than silently drop to plaintext
 
 
-def _live_key():
-    """None once the pod has been idle past the TTL, so a pod nobody is using
-    holds no key at all."""
+def _stale(entry, now):
+    return bool(KEY_TTL) and now - entry[1] > KEY_TTL
+
+
+def _key_for(kid):
+    """The key `kid` names, or None once it has aged out. Exact match only: an
+    upload sealed under one browser's key is not readable with another's, and
+    substituting the newest would hand the graph a decrypt failure in place of a
+    message saying which browser to go back to."""
+    if not kid:
+        return None
     with _key_lock:
-        if _session_key is None:
+        entry = _keys.get(kid)
+        if entry is None:
             return None
-        live = (bytes(_session_key), _session_kid)
-        stale = bool(KEY_TTL) and time.time() - _key_touched > KEY_TTL
-    if not stale:
-        return live
+        if not _stale(entry, time.time()):
+            entry[1] = time.time()
+            return bytes(entry[0])
     # Lock released before touching the queue -- never hold two at once.
     if _queue_busy():
-        return live
-    with _key_lock:
-        if _session_key is None:
-            return None
-        _zero_locked()
-    log.info("inline_preview: session key scrubbed after %ds idle", KEY_TTL)
+        with _key_lock:
+            entry = _keys.get(kid)
+            if entry is None:
+                return None
+            entry[1] = time.time()
+            return bytes(entry[0])
+    forget_key("idle %ds" % KEY_TTL, kid)
     return None
 
 
 def _key_sweeper():
-    """_live_key() only runs when something encrypts, so on its own the key
-    would sit in RAM untouched for exactly as long as the pod is idle -- which
-    is the case the TTL exists for. This is what actually scrubs it."""
+    """_key_for() only runs when something encrypts or decrypts, so on its own a
+    key would sit in RAM untouched for exactly as long as the pod is idle --
+    which is the case the TTL exists for. This is what actually scrubs it."""
     interval = max(5, min(30, KEY_TTL // 2))
     while True:
         time.sleep(interval)
         try:
+            now = time.time()
             with _key_lock:
-                idle = _session_key is not None and time.time() - _key_touched > KEY_TTL
+                idle = [k for k, e in _keys.items() if _stale(e, now)]
             if idle and not _queue_busy():
-                forget_key("idle %ds" % KEY_TTL)
+                for k in idle:
+                    forget_key("idle %ds" % KEY_TTL, k)
         except Exception:
             pass
+
+
+# -------------------------------------------------------- output pubkeys --
+# Outputs are sealed to a browser's PUBLIC key, so the pod holds nothing that
+# opens what is already in the store. These have no TTL and are never scrubbed,
+# on purpose: a public key is not a secret, and keeping it means encryption
+# cannot quietly fail open the way the symmetric path does when no browser has
+# posted. Registration IS authenticated, and every registered key is logged and
+# listed by /inline_preview/stats -- a key registered here receives a wrapped
+# copy of any preview that falls back to it, so they are worth being able to see.
+_pubkeys = {}            # pkid -> [public_key, spki_der, first_seen]
+_clients = {}            # ComfyUI client_id (sid) -> pkid
+_pub_lock = threading.Lock()
+MAX_PUBKEYS = 8
+
+SEAL_MAGIC = b"IP1"      # so a stale cached widget script fails loudly, not weirdly
+
+
+def _pkid(spki_der):
+    return hashlib.sha256(spki_der).hexdigest()[:16]
+
+
+def _recipient():
+    """-> (public_key, pkid), or None.
+
+    PromptServer.instance.client_id is set to the queuing client's sid for the
+    duration of an execution, so two browsers generating at once each get their
+    own previews sealed to their own key -- the race the single slot had, gone
+    rather than narrowed. Falling back to the most recently registered key
+    covers an API-queued prompt, whose client_id nobody registered: sealing that
+    to whoever is watching beats storing it in the clear."""
+    sid = getattr(PromptServer.instance, "client_id", None)
+    with _pub_lock:
+        pkid = _clients.get(sid) if sid else None
+        if pkid is None or pkid not in _pubkeys:
+            newest = max(_pubkeys.items(), key=lambda kv: kv[1][2], default=None)
+            if newest is None:
+                return None
+            pkid = newest[0]
+        return _pubkeys[pkid][0], pkid
 
 
 KEY_WAIT = float(os.environ.get("INLINE_KEY_WAIT", "8"))
@@ -164,39 +254,39 @@ def _await_key(kid, timeout):
     thread means the server loop keeps serving, so waiting here actually lets
     that POST land. The queue is busy throughout, so the key cannot be scrubbed
     out from under us."""
-    live = _live_key()
-    if live is not None and live[1] == kid:
-        return live
+    key = _key_for(kid)
+    if key is not None:
+        return key
 
-    log.info("inline_preview: waiting up to %.0fs for the browser to hand over its key", timeout)
+    log.info("inline_preview: waiting up to %.0fs for the browser to hand over key %s",
+             timeout, kid[:8])
     deadline = time.time() + timeout
     while time.time() < deadline:
         time.sleep(0.1)
-        live = _live_key()
-        if live is not None and live[1] == kid:
-            return live
-    return live
+        key = _key_for(kid)
+        if key is not None:
+            return key
+    return None
 
 
 def _decrypt_input(blob, kid):
     """Inputs must come back in the clear HERE, not in the browser, because the
     graph needs a tensor. The browser re-posts its key on execution_start and
     _queue_busy() holds it for the run, so the key is present exactly when this
-    needs it -- but say plainly what to do when it is not."""
+    needs it -- but say plainly what to do when it is not.
+
+    Every posted key is kept, so another browser queueing in parallel no longer
+    displaces the one this upload needs; a miss now means that browser has not
+    posted at all, not that it lost a race."""
     if not kid:
         return blob
-    live = _await_key(kid, KEY_WAIT)
-    if live is None:
+    key = _await_key(kid, KEY_WAIT)
+    if key is None:
         raise ValueError(
-            "LoadImageInline: this image is encrypted and no session key is loaded. "
-            "Open ComfyUI in the browser that uploaded it and queue again -- it "
-            "hands the key over on every run.")
-    key, current = live
-    if current != kid:
-        raise ValueError(
-            "LoadImageInline: this image was encrypted with a different key (%s, "
-            "loaded %s). Whichever browser uploaded it must be the one that queues, "
-            "or re-upload it here." % (kid[:8], current[:8]))
+            "LoadImageInline: this image is encrypted under key %s, which no browser "
+            "has handed over. Open ComfyUI in the browser that uploaded it and queue "
+            "again -- it posts its key on every run -- or re-upload the image here."
+            % kid[:8])
     try:
         return AESGCM(key).decrypt(bytes(blob[:12]), bytes(blob[12:]), None)
     except Exception as e:
@@ -268,29 +358,47 @@ def _warn_once(tag, msg):
         log.warning(msg)
 
 
-def _encrypt(data):
-    """-> (blob, kid). AES-GCM with a fresh 96-bit nonce per blob, prepended.
-    Distinct nonces under one key are what keeps GCM safe across many blobs."""
-    global _key_touched
-    if AESGCM is None:
+def _seal(data):
+    """-> (blob, pkid). A one-time AES-256 key per preview, wrapped to the
+    browser's public key and carried inside the blob:
+
+        b"IP1" | uint16 len(wrapped) | wrapped | 12-byte nonce | ciphertext
+
+    Packing it into the bytes rather than into BlobStore keeps the store, the
+    listing and the four routes over it unchanged.
+
+    The one-time key is deliberately NOT scrubbed, because it cannot be:
+    AESGCM.generate_key() returns immutable bytes and AESGCM() copies them into
+    OpenSSL's context regardless. It falls out of scope here and lands in
+    unscrubbed heap alongside the plaintext preview it just encrypted. What this
+    does buy is the thing the symmetric path could not: nothing resident in the
+    pod opens what is already in the store, so a snapshot taken between runs
+    yields ciphertext and a wrapped key with no private half anywhere on the box.
+    """
+    if AESGCM is None or RSAPublicKey is None:
         _warn_once("nocrypto",
                    "inline_preview: cryptography is not installed, so previews are stored "
                    "UNENCRYPTED (the password still gates them). Re-run provision.sh, or "
                    "pip install cryptography, and restart.")
         return data, ""
-    live = _live_key()
-    if live is None:
+    who = _recipient()
+    if who is None:
         _warn_once("nokey",
-                   "inline_preview: no session key has been posted, so previews are stored "
-                   "UNENCRYPTED (the password still gates them). Unlock the gallery once in "
-                   "the browser running ComfyUI -- POST /inline_preview/key needs the password, "
-                   "so a locked tab cannot hand its key over.")
+                   "inline_preview: no browser has registered a public key, so previews are "
+                   "stored UNENCRYPTED (the password still gates them). Open ComfyUI or "
+                   "/inline_preview/gallery once and unlock it -- POST /inline_preview/pubkey "
+                   "needs the password, so a locked tab cannot register. Once any browser has, "
+                   "the key is kept for the life of the process and this cannot recur.")
         return data, ""
-    key, kid = live
-    with _key_lock:
-        _key_touched = time.time()
+    pub, pkid = who
+
+    key = AESGCM.generate_key(bit_length=256)
     nonce = os.urandom(12)
-    return nonce + AESGCM(key).encrypt(nonce, data, None), kid
+    ct = AESGCM(key).encrypt(nonce, data, None)
+    wrapped = pub.encrypt(key, asym_padding.OAEP(
+        mgf=asym_padding.MGF1(algorithm=hashes.SHA256()),
+        algorithm=hashes.SHA256(), label=None))
+    return (SEAL_MAGIC + len(wrapped).to_bytes(2, "big") + wrapped + nonce + ct), pkid
 
 _EXT = {
     "image/png": ".png",
@@ -448,38 +556,55 @@ const srcOf = it => tok('../inline_preview?id='+encodeURIComponent(it.id));
 const TOK = new URLSearchParams(location.search).get('t') || '';
 const tok = p => TOK ? p+(p.includes('?')?'&':'?')+'t='+encodeURIComponent(TOK) : p;
 
-// Same origin as the ComfyUI tab, so this is the very same key it generated.
-const KEY_ITEM = 'inline_preview_session_key';
-const b64 = b => btoa(String.fromCharCode(...new Uint8Array(b)));
-const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
-// This page decrypts, it never publishes. The server holds ONE key, so a
-// gallery open in a different browser -- or a normal window while ComfyUI runs
-// in incognito -- would otherwise post its own key, take the slot, and leave
-// the tab that is actually generating unable to read its own previews.
-let keyBytes = null;
+// Same origin as the ComfyUI tab, so this reads the very same keypair out of
+// IndexedDB. This page decrypts, it never registers: a gallery open in a
+// different browser -- or a normal window while ComfyUI runs in incognito --
+// would otherwise register its own public key and become the fallback
+// recipient for previews the generating tab cannot then read.
+const DB_NAME = 'inline_preview', DB_STORE = 'keys', KP_ITEM = 'output_keypair';
+const hex16 = b =>
+  [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('').slice(0,16);
 
-function sessionKey(){
-  if(keyBytes) return keyBytes;
-  if(!globalThis.crypto?.subtle) return null;
-  let s = localStorage.getItem(KEY_ITEM);
-  if(!s){ s = b64(crypto.getRandomValues(new Uint8Array(32)));
-          localStorage.setItem(KEY_ITEM, s); }
-  keyBytes = unb64(s);
-  return keyBytes;
+function idb(){
+  return new Promise((res,rej)=>{
+    const rq = indexedDB.open(DB_NAME, 1);
+    rq.onupgradeneeded = () => rq.result.createObjectStore(DB_STORE);
+    rq.onsuccess = () => res(rq.result);
+    rq.onerror = () => rej(rq.error);
+  });
 }
 
-async function kidOf(raw){
-  const h = await crypto.subtle.digest('SHA-256', raw);
-  return [...new Uint8Array(h)].map(b=>b.toString(16).padStart(2,'0')).join('').slice(0,16);
+let kpPromise = null;
+function keyPair(){
+  return (kpPromise ||= (async () => {
+    if(!globalThis.crypto?.subtle || !globalThis.indexedDB) return null;
+    try{
+      const db = await idb();
+      return await new Promise((res,rej)=>{
+        const rq = db.transaction(DB_STORE,'readonly').objectStore(DB_STORE).get(KP_ITEM);
+        rq.onsuccess = () => res(rq.result || null);
+        rq.onerror = () => rej(rq.error);
+      });
+    }catch(e){ return null; }
+  })());
 }
+
+const SEAL_MAGIC = [0x49,0x50,0x31];
 
 async function decryptBlob(buf, it){
   if(!it.kid) return buf;
-  const raw = sessionKey();
-  if(!raw) throw new Error('nokey');
-  if(await kidOf(raw) !== it.kid) throw new Error('otherkey');
+  const u8 = new Uint8Array(buf);
+  if(u8.length < 5 || SEAL_MAGIC.some((b,i)=>u8[i]!==b)) throw new Error('badseal');
+  const wlen = (u8[3]<<8) | u8[4];
+  const kp = await keyPair();
+  if(!kp) throw new Error('nokey');
+  const spki = await crypto.subtle.exportKey('spki', kp.publicKey);
+  if(hex16(await crypto.subtle.digest('SHA-256', spki)) !== it.kid) throw new Error('otherkey');
+  const raw = await crypto.subtle.decrypt({name:'RSA-OAEP'}, kp.privateKey,
+                                          u8.subarray(5, 5+wlen));
   const ck = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['decrypt']);
-  return crypto.subtle.decrypt({name:'AES-GCM', iv: buf.slice(0,12)}, ck, buf.slice(12));
+  return crypto.subtle.decrypt({name:'AES-GCM', iv: u8.subarray(5+wlen, 17+wlen)},
+                               ck, u8.subarray(17+wlen));
 }
 
 let blobMode = true;
@@ -579,7 +704,9 @@ document.getElementById('pw').addEventListener('keydown', e => {
   if(e.key === 'Enter') login();
 });
 
-const CRYPTMSG = {nokey:'no key in this browser', otherkey:'different session key'};
+const CRYPTMSG = {nokey:'no keypair in this browser',
+                  otherkey:'sealed to another browser',
+                  badseal:'unknown format \\u2014 hard-reload'};
 
 async function hydrate(card, it){
   if(held.has(it.id)) return;
@@ -761,9 +888,9 @@ def _with_cookie(resp):
 
 @PromptServer.instance.routes.post("/inline_preview/key")
 async def _inline_preview_key(request):
-    """Take the browser's session key. Authenticated, so the password is what
-    stops anyone else from swapping the key out from under you."""
-    global _session_key, _session_kid, _key_touched
+    """Take a browser's session key. Authenticated, so the password is what
+    stops anyone else from adding one. Keys accumulate rather than replacing
+    each other, so a second browser no longer takes the slot from the first."""
     deny = _guard(request)
     if deny is not None:
         return deny
@@ -776,18 +903,65 @@ async def _inline_preview_key(request):
     if len(raw) != 32:
         return web.json_response({"ok": False, "reason": "bad-key"}, status=400)
 
+    kid = _kid(raw)
     with _key_lock:
-        fresh = _session_key is None or bytes(_session_key) != raw
+        entry = _keys.get(kid)
+        fresh = entry is None
         if fresh:
-            _zero_locked()
-            _session_key = bytearray(raw)
-            _session_kid = _kid(raw)
-        _key_touched = time.time()
-        kid = _session_kid
+            # Oldest first, so the browser that just spoke is never the one dropped.
+            while len(_keys) >= MAX_KEYS:
+                _zero_locked(min(_keys.items(), key=lambda kv: kv[1][1])[0])
+            _keys[kid] = [bytearray(raw), time.time()]
+        else:
+            entry[1] = time.time()
+        held = len(_keys)
     if fresh:
         _warned.discard("nokey")   # so a later lapse warns again rather than staying quiet
-        log.info("inline_preview: session key set (kid %s) -- new previews are encrypted", kid)
+        log.info("inline_preview: session key set (kid %s, %d held) -- new previews "
+                 "are encrypted", kid, held)
     return web.json_response({"ok": True, "kid": kid, "ttl": KEY_TTL})
+
+
+@PromptServer.instance.routes.post("/inline_preview/pubkey")
+async def _inline_preview_pubkey(request):
+    """Register a browser's public key for output sealing. Authenticated, so
+    the password is what stops anyone else from registering one -- which matters,
+    because a registered key receives a wrapped copy of anything that falls back
+    to it. Nothing secret arrives here and nothing is ever scrubbed."""
+    deny = _guard(request)
+    if deny is not None:
+        return deny
+    if AESGCM is None or RSAPublicKey is None:
+        return web.json_response({"ok": False, "reason": "no-crypto"}, status=501)
+
+    body = {}
+    try:
+        body = await request.json()
+        spki = base64.b64decode(body.get("key", ""), validate=True)
+        pub = serialization.load_der_public_key(spki)
+    except Exception:
+        return web.json_response({"ok": False, "reason": "bad-key"}, status=400)
+    # An EC or Ed25519 key would load fine and then fail at wrap time, one
+    # preview at a time, silently storing plaintext. Refuse it here instead.
+    if not isinstance(pub, RSAPublicKey) or pub.key_size < 2048:
+        return web.json_response({"ok": False, "reason": "bad-key"}, status=400)
+
+    pkid = _pkid(spki)
+    sid = str(body.get("client_id") or "")
+    with _pub_lock:
+        fresh = pkid not in _pubkeys
+        if fresh:
+            while len(_pubkeys) >= MAX_PUBKEYS:
+                _pubkeys.pop(min(_pubkeys.items(), key=lambda kv: kv[1][2])[0], None)
+            _pubkeys[pkid] = [pub, spki, time.time()]
+        if sid:
+            _clients[sid] = pkid
+        held = len(_pubkeys)
+    if fresh:
+        _warned.discard("nokey")
+        log.info("inline_preview: public key registered (pkid %s, client %s, %d held) "
+                 "-- new previews are sealed to it", pkid, sid[:8] or "?", held)
+    return web.json_response({"ok": True, "pkid": pkid})
 
 
 @PromptServer.instance.routes.get("/inline_preview")
@@ -826,7 +1000,11 @@ async def _inline_preview_stats(request):
     deny = _guard(request)
     if deny is not None:
         return deny
-    return web.json_response(STORE.stats())
+    # Registered pubkeys are listed because one of them may be receiving sealed
+    # copies of your previews. An entry you do not recognise is worth knowing about.
+    with _pub_lock:
+        pubkeys = sorted(_pubkeys.keys())
+    return web.json_response(dict(STORE.stats(), pubkeys=pubkeys))
 
 
 @PromptServer.instance.routes.post("/inline_preview/delete")
@@ -845,10 +1023,10 @@ async def _inline_preview_clear(request):
     deny = _guard(request)
     if deny is not None:
         return deny
+    # Outputs no longer use a key the pod holds, so there is nothing left here
+    # to forget -- clearing the store IS the whole of it. The upload keys stay,
+    # because they belong to INPUTS and a graph may be mid-run on one.
     STORE.clear()
-    # "clear all" means all of it -- otherwise the key outlives every blob it
-    # was ever used on. The browser re-posts before the next queue.
-    forget_key("store cleared")
     return web.json_response(STORE.stats())
 
 
@@ -910,6 +1088,9 @@ async def _inline_input_clear(request):
     if deny is not None:
         return deny
     INPUTS.clear()
+    # These keys exist only to open uploads, so dropping every upload retires
+    # them all. The browser re-posts on the way into the next queue.
+    forget_key("inputs cleared")
     return web.json_response(INPUTS.stats())
 
 
@@ -1155,7 +1336,7 @@ class PreviewImageInline:
         out = []
         for frame in _to_uint8(images):
             data, mime = _encode_still(frame, format, quality)
-            blob, kid = _encrypt(data)
+            blob, kid = _seal(data)
             out.append({"id": STORE.put(blob, mime, False, kid), "type": mime,
                         "bytes": len(blob), "kid": kid})
         return {"ui": {"inline": out}}
@@ -1217,7 +1398,7 @@ class PreviewVideoInline:
             data, mime = _encode_animated_webp(arr, rate, quality)
             has_audio = False
 
-        blob, kid = _encrypt(data)
+        blob, kid = _seal(data)
         return {"ui": {"inline": [
             {"id": STORE.put(blob, mime, has_audio, kid), "type": mime, "bytes": len(blob),
              "audio": has_audio, "kid": kid,
@@ -1229,8 +1410,9 @@ if KEY_TTL:
     threading.Thread(target=_key_sweeper, daemon=True,
                      name="inline_preview_key_sweeper").start()
 else:
-    log.warning("inline_preview: INLINE_PREVIEW_KEY_TTL=0 -- the encryption key "
-                "stays in RAM for the life of the process once posted")
+    log.warning("inline_preview: INLINE_PREVIEW_KEY_TTL=0 means NEVER SCRUBBED -- every "
+                "key posted stays in RAM for the life of the process. Set 1, not 0, if "
+                "what you wanted was to drop them as soon as the queue drains.")
 
 if not TOKEN:
     log.warning("inline_preview: INLINE_PREVIEW_TOKEN is empty -- /inline_preview/list "

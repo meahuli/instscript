@@ -11,18 +11,26 @@ const EXT = {
   "video/webm": ".webm",
 };
 
-// The gallery lives on this same origin, so it shares this localStorage entry
-// and needs no key of its own. Incognito wipes it when the last window closes,
-// which strands anything still in the store -- that is the deal with a random
-// per-session key rather than one derived from something you can retype.
-const KEY_ITEM = "inline_preview_session_key";
+// The gallery lives on this same origin, so it shares both of these and needs
+// nothing of its own. Incognito wipes them when the last window closes, which
+// strands anything still in the store -- that is the deal with per-session keys
+// rather than ones derived from something you can retype.
+const KEY_ITEM = "inline_preview_session_key";   // uploads, symmetric
+const DB_NAME = "inline_preview";                // outputs, RSA keypair
+const DB_STORE = "keys";
+const KP_ITEM = "output_keypair";
 
 const b64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
 const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
 
+const hex16 = buf =>
+  [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
+
 let keyBytes = null;
 let keyPublished = false;
+let pubPublished = false;
 
+// -- uploads: symmetric, because ComfyUI has to decrypt these to make a tensor.
 function sessionKey() {
   if (keyBytes) return keyBytes;
   // crypto.subtle only exists in a secure context: https, or localhost (which
@@ -38,8 +46,109 @@ function sessionKey() {
 }
 
 async function kidOf(raw) {
-  const h = await crypto.subtle.digest("SHA-256", raw);
-  return [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
+  return hex16(await crypto.subtle.digest("SHA-256", raw));
+}
+
+// -- outputs: the private key never leaves this browser, and is generated
+// non-extractable so it cannot leave at all. That is why it lives in IndexedDB
+// and not localStorage: localStorage stores strings, so anything kept there has
+// to be extractable, and every custom node's JS shares this origin and can read
+// it. generateKey applies `false` to the private key only -- the public half
+// stays exportable, which is the half we register.
+function idb() {
+  return new Promise((res, rej) => {
+    const rq = indexedDB.open(DB_NAME, 1);
+    rq.onupgradeneeded = () => rq.result.createObjectStore(DB_STORE);
+    rq.onsuccess = () => res(rq.result);
+    rq.onerror = () => rej(rq.error);
+  });
+}
+
+// Put-if-absent inside one transaction, returning whichever value won. Two tabs
+// opening at once would otherwise both generate and the second would overwrite
+// the first, leaving a tab holding a private key whose public half is gone.
+function idbClaim(db, made) {
+  return new Promise((res, rej) => {
+    const tx = db.transaction(DB_STORE, "readwrite");
+    const os = tx.objectStore(DB_STORE);
+    const rq = os.get(KP_ITEM);
+    let out = made;
+    rq.onsuccess = () => { if (rq.result) out = rq.result; else os.put(made, KP_ITEM); };
+    tx.oncomplete = () => res(out);
+    tx.onerror = () => rej(tx.error);
+  });
+}
+
+let kpPromise = null;
+
+// Cached as the promise, not the result: concurrent callers must not each
+// generate a pair and race.
+function keyPair() {
+  return (kpPromise ||= (async () => {
+    if (!globalThis.crypto?.subtle || !globalThis.indexedDB) return null;
+    try {
+      const db = await idb();
+      const made = await crypto.subtle.generateKey(
+        { name: "RSA-OAEP", modulusLength: 2048, hash: "SHA-256" },
+        false,
+        ["encrypt", "decrypt"]);
+      return await idbClaim(db, made);
+    } catch (e) {
+      console.warn("inline_preview: no output keypair —", e);
+      return null;
+    }
+  })());
+}
+
+async function myPkid() {
+  const kp = await keyPair();
+  if (!kp) return null;
+  const spki = await crypto.subtle.exportKey("spki", kp.publicKey);
+  return { spki, pkid: hex16(await crypto.subtle.digest("SHA-256", spki)) };
+}
+
+let lastPub = 0;
+
+async function publishPubKey(force) {
+  if (pubPublished && !force) return;
+  // Re-registered on every run, not just once: the pod can restart under a tab
+  // that still thinks it registered, and the fallback is plaintext storage.
+  // Same burst-collapsing as publishKey, since `status` fires repeatedly.
+  const now = Date.now();
+  if (force && now - lastPub < 3000) return;
+  lastPub = now;
+  const me = await myPkid();
+  if (!me) return;
+  try {
+    const r = await fetch(api.apiURL("/inline_preview/pubkey"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: b64(me.spki), client_id: api.clientId || "" }),
+    });
+    pubPublished = r.ok;   // 403 until this browser is unlocked; retried later
+    if (!r.ok) console.warn("inline_preview: pubkey not accepted — previews will be unencrypted");
+  } catch (e) {}
+}
+
+// b"IP1" | uint16 len(wrapped) | wrapped | 12-byte nonce | ciphertext
+const SEAL_MAGIC = [0x49, 0x50, 0x31];
+
+async function unseal(buf, item) {
+  if (!item.kid) return buf;                       // stored in the clear
+  const u8 = new Uint8Array(buf);
+  if (u8.length < 5 || SEAL_MAGIC.some((b, i) => u8[i] !== b)) throw new Error("badseal");
+  const wlen = (u8[3] << 8) | u8[4];
+  const wrapped = u8.subarray(5, 5 + wlen);
+  const nonce = u8.subarray(5 + wlen, 17 + wlen);
+  const ct = u8.subarray(17 + wlen);
+
+  const me = await myPkid();
+  if (!me) throw new Error("nokey");
+  if (me.pkid !== item.kid) throw new Error("otherkey");
+  const kp = await keyPair();
+  const raw = await crypto.subtle.decrypt({ name: "RSA-OAEP" }, kp.privateKey, wrapped);
+  const ck = await crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["decrypt"]);
+  return crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, ck, ct);
 }
 
 let lastPublish = 0;
@@ -77,11 +186,13 @@ function armKey() {
     return;
   }
   for (const ev of ["execution_start", "promptQueued", "status"]) {
-    api.addEventListener(ev, () => publishKey(true));
+    api.addEventListener(ev, () => { publishKey(true); publishPubKey(true); });
   }
 }
 
-async function decryptBlob(buf, item) {
+// Uploads only. Outputs go through unseal() -- they are sealed to the public
+// key, and this key never opens them.
+async function decryptUpload(buf, item) {
   if (!item.kid) return buf;
   const raw = sessionKey();
   if (!raw) throw new Error("nokey");
@@ -134,22 +245,24 @@ async function hydrate(node, item, wrap) {
   const MSG = {
     expired: "preview expired (evicted from the RAM store) — re-queue to regenerate",
     locked: "locked — open /inline_preview/gallery?t=<password> once to unlock this browser",
-    nokey: "no decryption key in this browser (needs https or localhost)",
-    otherkey: "encrypted with a key this browser no longer has — re-queue to regenerate",
+    nokey: "no keypair in this browser (needs https or localhost)",
+    otherkey: "sealed to another browser's key — re-queue to regenerate one for this browser",
+    badseal: "unrecognised preview format — hard-reload the page to pick up the current script",
   };
 
   let obj;
   try {
     const r = await fetch(url, { cache: "no-store" });
-    if (r.status === 403) { keyPublished = false; throw new Error("locked"); }
+    if (r.status === 403) { keyPublished = pubPublished = false; throw new Error("locked"); }
     if (r.status === 404) throw new Error("expired");
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const buf = await decryptBlob(await r.arrayBuffer(), item);
+    const buf = await unseal(await r.arrayBuffer(), item);
     obj = URL.createObjectURL(new Blob([buf], { type: item.type }));
   } catch (e) {
-    // Something else took the server's single key slot. Claim it back so the
-    // next generation is readable here, rather than failing the same way again.
-    if (e.message === "otherkey") publishKey(true);
+    // Sealed to a public key that is not ours -- another browser queued this, or
+    // the pod restarted and fell back before we re-registered. Register now so
+    // the next generation is readable here rather than failing the same way.
+    if (e.message === "otherkey") publishPubKey(true);
     note(wrap, MSG[e.message] || `could not load preview (${e.message})`, "#c88");
     return;
   }
@@ -201,7 +314,9 @@ function render(node, items) {
   const el = node._inlineEl;
   if (!el) return;
 
-  publishKey();   // no-op once accepted; retries after the browser is unlocked
+  // Both no-op once accepted; they retry after the browser is unlocked.
+  publishKey();
+  publishPubKey();
   revokeAll(node);
   el.replaceChildren();
 
@@ -307,7 +422,7 @@ async function show(node, ui, id, label, localFile) {
 
   const kid = r.headers.get("X-Inline-Kid") || "";
   let buf;
-  try { buf = await decryptBlob(await r.arrayBuffer(), { kid }); }
+  try { buf = await decryptUpload(await r.arrayBuffer(), { kid }); }
   catch (e) {
     ui.img.style.display = "none";
     ui.status.textContent = e.message === "otherkey"
@@ -409,6 +524,7 @@ app.registerExtension({
   async setup() {
     armKey();
     publishKey();
+    publishPubKey();
   },
 
   async beforeRegisterNodeDef(nodeType, nodeData) {
