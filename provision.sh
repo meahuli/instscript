@@ -11,12 +11,12 @@ SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 #   PROVISION_REF=other bash provision.sh  -> that branch, tag or sha
 #   PROVISION_REF= bash provision.sh       -> no switch, use what is checked out
 #
-# !! MOVE THIS BACK TO main WHEN inline-preview-pke MERGES. Until then every
-# !! provision is pulled onto the feature branch on purpose. Once it is merged
-# !! this default is actively wrong, and once the branch is deleted it resolves
-# !! to nothing -- which is why an unresolvable DEFAULT only warns and carries
-# !! on, while a ref you asked for explicitly is a hard failure.
-PROVISION_REF_DEFAULT="inline-preview-pke"
+# Point this at a branch to make every pod provision from it -- useful while
+# testing one, and worth moving back here afterwards, since a default left on a
+# merged branch keeps dragging provisions onto something stale. A default that
+# no longer resolves (deleted branch) only warns and carries on; a ref asked for
+# explicitly is a hard failure.
+PROVISION_REF_DEFAULT="main"
 
 if [ -z "${PROVISION_REF+isset}" ]; then
   PROVISION_REF="$PROVISION_REF_DEFAULT"; PROVISION_REF_SOFT=1
