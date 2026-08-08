@@ -9,14 +9,19 @@ Results are encoded in-process and held in a byte-capped LRU dict. The node's
 Nothing is ever written to disk, tmpfs, or anywhere else. ComfyUI never calls
 open() for these results.
 
-Store size: INLINE_PREVIEW_MAX_MB env var (default 2048).
+Store size:  INLINE_PREVIEW_MAX_MB     env var (default 2048)
+Gallery key: INLINE_PREVIEW_TOKEN      env var (default: random per boot; the
+             URL is logged at startup. Set empty to disable the check.)
+CORS:        INLINE_PREVIEW_ALLOW_ORIGIN  env var (default: same-origin only)
 """
 
 import io
 import os
+import hmac
 import time
 import uuid
 import logging
+import secrets
 import threading
 from fractions import Fraction
 from collections import OrderedDict
@@ -29,6 +34,11 @@ from server import PromptServer
 log = logging.getLogger("inline_preview")
 
 MAX_STORE_BYTES = int(os.environ.get("INLINE_PREVIEW_MAX_MB", "2048")) * 1024 * 1024
+
+_env_token = os.environ.get("INLINE_PREVIEW_TOKEN")
+TOKEN = secrets.token_urlsafe(16) if _env_token is None else _env_token
+
+ALLOWED_ORIGIN = os.environ.get("INLINE_PREVIEW_ALLOW_ORIGIN", "")
 
 _EXT = {
     "image/png": ".png",
@@ -142,6 +152,8 @@ const human = b => { const u=['B','KB','MB','GB']; let i=0,n=b;
 const ago = s => s<60?Math.round(s)+'s ago'
   : s<3600?Math.round(s/60)+'m ago' : (s/3600).toFixed(1)+'h ago';
 const srcOf = it => '../inline_preview?id='+encodeURIComponent(it.id);
+const TOK = new URLSearchParams(location.search).get('t') || '';
+const tok = p => TOK ? p+(p.includes('?')?'&':'?')+'t='+encodeURIComponent(TOK) : p;
 
 let blobMode = true;
 const held = new Map();
@@ -182,8 +194,15 @@ async function load(){
   const grid = document.getElementById('grid');
   if(io){ io.disconnect(); io = null; }
 
-  try { listing = await (await fetch('list',{cache:'no-store'})).json(); }
+  let r;
+  try { r = await fetch(tok('list'),{cache:'no-store'}); }
   catch(e){ grid.innerHTML='<div class="empty">could not reach ComfyUI</div>'; return; }
+  if(r.status === 403){
+    grid.innerHTML='<div class="empty">missing or bad token &mdash; open the '
+      +'gallery URL printed in the ComfyUI log</div>'; return;
+  }
+  try { listing = await r.json(); }
+  catch(e){ grid.innerHTML='<div class="empty">could not read the listing</div>'; return; }
 
   updateMeta();
   grid.replaceChildren();
@@ -233,7 +252,7 @@ async function load(){
 
 async function wipe(){
   if(!confirm('Drop every preview held in RAM? This cannot be undone.')) return;
-  await fetch('clear',{method:'POST'});
+  await fetch(tok('clear'),{method:'POST'});
   revokeAll();
   load();
 }
@@ -243,8 +262,38 @@ load();
 """
 
 
+def _same_origin(request):
+    """ComfyUI's --enable-cors-header stamps Access-Control-Allow-Origin on every
+    response, which would let any page the browser happens to have open read
+    these routes. Browsers send Origin only on cross-origin requests, so an
+    absent Origin (curl, or the ComfyUI UI itself) passes; a mismatch does not."""
+    origin = request.headers.get("Origin")
+    if not origin or ALLOWED_ORIGIN == "*":
+        return True
+    if ALLOWED_ORIGIN and origin == ALLOWED_ORIGIN:
+        return True
+    return origin.split("://", 1)[-1] == request.headers.get("Host", "")
+
+
+def _guard(request, need_token=True):
+    """-> a Response to return immediately, or None to carry on. Blob reads skip
+    the token: the node's widget only ever knows the id, and a uuid4 is not
+    enumerable without /list."""
+    if not _same_origin(request):
+        return web.Response(status=403, text="cross-origin request refused")
+    if need_token and TOKEN:
+        got = (request.rel_url.query.get("t")
+               or request.headers.get("X-Inline-Preview-Token", ""))
+        if not hmac.compare_digest(got, TOKEN):
+            return web.Response(status=403, text="missing or bad token")
+    return None
+
+
 @PromptServer.instance.routes.get("/inline_preview")
 async def _inline_preview(request):
+    deny = _guard(request, need_token=False)
+    if deny is not None:
+        return deny
     key = request.rel_url.query.get("id", "")
     item = STORE.get(key)
     if item is None:
@@ -263,22 +312,34 @@ async def _inline_preview(request):
 
 @PromptServer.instance.routes.get("/inline_preview/list")
 async def _inline_preview_list(request):
+    deny = _guard(request)
+    if deny is not None:
+        return deny
     return web.json_response(STORE.listing())
 
 
 @PromptServer.instance.routes.get("/inline_preview/stats")
 async def _inline_preview_stats(request):
+    deny = _guard(request)
+    if deny is not None:
+        return deny
     return web.json_response(STORE.stats())
 
 
 @PromptServer.instance.routes.post("/inline_preview/clear")
 async def _inline_preview_clear(request):
+    deny = _guard(request)
+    if deny is not None:
+        return deny
     STORE.clear()
     return web.json_response(STORE.stats())
 
 
 @PromptServer.instance.routes.get("/inline_preview/gallery")
 async def _inline_preview_gallery(request):
+    deny = _guard(request)
+    if deny is not None:
+        return deny
     return web.Response(text=_GALLERY_HTML, content_type="text/html",
                         headers={"Cache-Control": "no-store"})
 
@@ -575,12 +636,18 @@ class PreviewVideoInline:
         ]}}
 
 
+if TOKEN:
+    log.info("inline_preview: gallery at /inline_preview/gallery?t=%s", TOKEN)
+else:
+    log.warning("inline_preview: INLINE_PREVIEW_TOKEN is empty -- /inline_preview/list "
+                "enumerates every preview id to anyone who reaches the port")
+
 try:
     from . import history_redact
     history_redact.install()
 except Exception as e:
-    log.error("inline_preview: history redaction could not be installed (%s). "
-              "Prompts REMAIN readable via GET /history.", e)
+    log.error("inline_preview: redaction could not be installed (%s). "
+              "Prompts REMAIN readable via GET /history and GET /queue.", e)
 
 
 NODE_CLASS_MAPPINGS = {

@@ -1,5 +1,5 @@
 """
-Strip prompt text from ComfyUI's in-RAM prompt history.
+Strip prompt text from ComfyUI's in-RAM prompt queue and history.
 
 PromptQueue.task_done() stores the whole queue tuple, so history holds the API
 graph (every widget value, including positive/negative prompt text) and
@@ -7,8 +7,13 @@ extra_data.extra_pnginfo.workflow (the full UI graph). GET /history serves all
 of it unauthenticated. --disable-metadata does NOT cover this; it only governs
 what gets embedded in saved image files.
 
+Redacting only at task_done would leave the same two slots readable via
+GET /queue for as long as a job runs plus however long it sits pending -- minutes
+on a video generation -- so the queue getters are wrapped too.
+
 This wraps task_done and blanks those two slots after the record is stored,
-leaving "outputs" intact so blob ids stay reachable.
+leaving "outputs" intact so blob ids stay reachable. Cost: the frontend can no
+longer restore a workflow from a queue or history entry.
 
 Off switch:  INLINE_PREVIEW_REDACT_HISTORY=0
 
@@ -27,6 +32,8 @@ ENABLED = os.environ.get("INLINE_PREVIEW_REDACT_HISTORY", "1") not in ("0", "fal
 
 _EXPECTED_PARAMS = ["self", "item_id", "history_result", "status"]
 
+_QUEUE_GETTERS = ("get_current_queue", "get_current_queue_volatile")
+
 _verified = False
 _broken = False
 
@@ -43,6 +50,45 @@ def _redact_record(rec):
     return True
 
 
+def _redact_item(item):
+    """Copy, then blank. get_current_queue() deep-copies only the pending list --
+    currently_running items come back by reference, so blanking one in place
+    would tear the graph out from under the job that is still executing."""
+    if not isinstance(item, (list, tuple)) or len(item) < 4:
+        return item
+    scrubbed = list(item)
+    scrubbed[2] = {}
+    scrubbed[3] = {}
+    return tuple(scrubbed) if isinstance(item, tuple) else scrubbed
+
+
+def _install_queue_getter(queue_cls, name):
+    """Wrap one of the /queue getters. Returns True if it is now covered."""
+    orig = getattr(queue_cls, name, None)
+    if orig is None:
+        return False
+    if getattr(orig, "_inline_preview_patched", False):
+        return True
+
+    try:
+        params = list(inspect.signature(orig).parameters)
+    except (TypeError, ValueError):
+        params = None
+    if params != ["self"]:
+        log.error("inline_preview: %s not redacted -- signature is %s, expected ['self']. "
+                  "Prompts REMAIN readable via GET /queue.", name, params)
+        return False
+
+    def getter(self):
+        running, pending = orig(self)
+        return ([_redact_item(i) for i in running], [_redact_item(i) for i in pending])
+
+    getter._inline_preview_patched = True
+    getter._inline_preview_orig = orig
+    setattr(queue_cls, name, getter)
+    return True
+
+
 def install():
     global _verified, _broken
 
@@ -54,11 +100,24 @@ def install():
     try:
         import execution
     except Exception as e:
-        log.error("inline_preview: history redaction OFF -- cannot import execution (%s). "
-                  "Prompts REMAIN readable via GET /history.", e)
+        log.error("inline_preview: redaction OFF -- cannot import execution (%s). "
+                  "Prompts REMAIN readable via GET /history and GET /queue.", e)
         return
 
     queue_cls = getattr(execution, "PromptQueue", None)
+    if queue_cls is None:
+        log.error("inline_preview: redaction OFF -- execution.PromptQueue not found. "
+                  "Prompts REMAIN readable via GET /history and GET /queue.")
+        return
+
+    covered = [n for n in _QUEUE_GETTERS if _install_queue_getter(queue_cls, n)]
+    if covered:
+        log.info("inline_preview: /queue redaction installed (%s)", ", ".join(covered))
+    else:
+        log.error("inline_preview: /queue redaction OFF -- none of %s could be wrapped. "
+                  "Prompts REMAIN readable via GET /queue while jobs run or sit pending.",
+                  list(_QUEUE_GETTERS))
+
     orig = getattr(queue_cls, "task_done", None)
     if orig is None:
         log.error("inline_preview: history redaction OFF -- execution.PromptQueue.task_done "

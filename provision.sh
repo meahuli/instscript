@@ -125,6 +125,8 @@ if [ "$PROVIDER" = "runpod" ]; then
 --output-directory /dev/shm/output
 --temp-directory /dev/shm/temp
 --disable-metadata
+# Do NOT add a bare --enable-cors-header: it means '*', and lets any page open in
+# your browser read this ComfyUI through the tunnel. The built-in UI is same-origin.
 # Optional (one flag per line, still no inline comments):
 # --listen 127.0.0.1
 # --preview-method auto
@@ -133,8 +135,22 @@ EOF
   echo "==> wrote $ARGS_FILE"
 else
   echo "==> $PROVIDER: ComfyUI args come from the COMFYUI_ARGS env var (set in the template), not a file."
-  echo "    Ensure the template sets: --port 18188 --enable-cors-header --output-directory /dev/shm/output --temp-directory /dev/shm/temp --disable-metadata"
+  echo "    Ensure the template sets: --port 18188 --output-directory /dev/shm/output --temp-directory /dev/shm/temp --disable-metadata"
 fi
+
+case " ${COMFYUI_ARGS:-} " in
+  *" --enable-cors-header "*|*" --enable-cors-header")
+    echo ""
+    echo "!!  COMFYUI_ARGS contains a bare --enable-cors-header, which means '*'."
+    echo "!!  Every response then carries Access-Control-Allow-Origin: *, so any page"
+    echo "!!  open in your browser can read this ComfyUI through the tunnel -- /history,"
+    echo "!!  /queue, and every preview blob. The tunnel does not stop it; the browser"
+    echo "!!  resolves localhost itself."
+    echo "!!  Drop the flag (the built-in UI is same-origin and does not need it). If the"
+    echo "!!  Vast portal turns out to need it, scope it: --enable-cors-header <origin>"
+    echo ""
+    ;;
+esac
 
 echo ""
 echo "============================================================"
