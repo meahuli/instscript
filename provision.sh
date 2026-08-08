@@ -125,6 +125,11 @@ if [ "$PROVIDER" = "runpod" ]; then
 --output-directory /dev/shm/output
 --temp-directory /dev/shm/temp
 --disable-metadata
+--cache-none
+# --cache-none: node outputs are not kept between runs, so the decoded frames
+# stop sitting in RAM until some later run displaces them. Costs a full re-run
+# of every node each queue (models have their own cache and should stay loaded).
+# Drop this line if the re-execution is too slow, or soften it to --cache-lru 4.
 # Do NOT add a bare --enable-cors-header: it means '*', and lets any page open in
 # your browser read this ComfyUI through the tunnel. The built-in UI is same-origin.
 # Optional (one flag per line, still no inline comments):
@@ -135,7 +140,9 @@ EOF
   echo "==> wrote $ARGS_FILE"
 else
   echo "==> $PROVIDER: ComfyUI args come from the COMFYUI_ARGS env var (set in the template), not a file."
-  echo "    Ensure the template sets: --port 18188 --output-directory /dev/shm/output --temp-directory /dev/shm/temp --disable-metadata"
+  echo "    Ensure the template sets: --port 18188 --output-directory /dev/shm/output --temp-directory /dev/shm/temp --disable-metadata --cache-none"
+  echo "    (--cache-none keeps decoded frames from lingering in RAM between runs;"
+  echo "     drop it or use --cache-lru 4 if re-executing every node is too slow.)"
 fi
 
 case " ${COMFYUI_ARGS:-} " in
