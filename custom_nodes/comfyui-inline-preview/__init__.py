@@ -351,6 +351,8 @@ function revokeAll(){
 }
 
 async function drop(it, card){
+  if(!confirm('Delete this preview? It only exists in RAM, so it cannot be recovered.'))
+    return;
   let r;
   try{ r = await fetch(tok('delete?id='+encodeURIComponent(it.id)), {method:'POST'}); }
   catch(e){ return; }
