@@ -10,8 +10,9 @@ Nothing is ever written to disk, tmpfs, or anywhere else. ComfyUI never calls
 open() for these results.
 
 Store size:  INLINE_PREVIEW_MAX_MB     env var (default 2048)
-Gallery key: INLINE_PREVIEW_TOKEN      env var (default: random per boot; the
-             URL is logged at startup. Set empty to disable the check.)
+Password:    INLINE_PREVIEW_TOKEN      env var. The gallery prompts for it and
+             remembers the answer in a cookie. Unset = random per boot (logged
+             at startup, so paste it once); empty = no password at all.
 CORS:        INLINE_PREVIEW_ALLOW_ORIGIN  env var (default: same-origin only)
 """
 
@@ -20,6 +21,7 @@ import os
 import hmac
 import time
 import uuid
+import asyncio
 import logging
 import secrets
 import threading
@@ -39,6 +41,11 @@ _env_token = os.environ.get("INLINE_PREVIEW_TOKEN")
 TOKEN = secrets.token_urlsafe(16) if _env_token is None else _env_token
 
 ALLOWED_ORIGIN = os.environ.get("INLINE_PREVIEW_ALLOW_ORIGIN", "")
+
+COOKIE = "inline_preview_session"
+COOKIE_MAX_AGE = 12 * 3600
+_SESSION = secrets.token_urlsafe(24)
+_fails = 0
 
 _EXT = {
     "image/png": ".png",
@@ -132,10 +139,17 @@ _GALLERY_HTML = """<!doctype html>
  .empty{color:#666;padding:32px 0;text-align:center}
  label.tog{color:#888;font-size:12px;display:flex;align-items:center;gap:5px;
            cursor:pointer;user-select:none}
+ #login{display:none;max-width:260px;margin:64px auto;text-align:center}
+ #login p{color:#888;margin:0 0 12px}
+ #login input{width:100%;box-sizing:border-box;background:#161616;color:#ddd;
+   border:1px solid #333;border-radius:4px;padding:8px 10px;font:inherit}
+ #login button{width:100%;margin-top:8px;padding:8px}
+ #login .err{color:#c88;font-size:12px;min-height:18px;margin-top:8px}
+ #tools{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 </style>
 <header>
   <h1>inline preview &mdash; RAM store</h1>
-  <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+  <div id="tools">
     <span class="meta" id="meta">loading...</span>
     <label class="tog"><input type="checkbox" id="blobmode" checked
       onchange="setBlobMode(this.checked)">keep in browser</label>
@@ -143,6 +157,12 @@ _GALLERY_HTML = """<!doctype html>
     <button class="danger" onclick="wipe()">clear all</button>
   </div>
 </header>
+<div id="login">
+  <p>This gallery is locked.</p>
+  <input type="password" id="pw" placeholder="password" autocomplete="current-password">
+  <button onclick="login()">unlock</button>
+  <div class="err" id="pwerr"></div>
+</div>
 <div id="grid"></div>
 <script>
 const EXT = {'image/png':'.png','image/jpeg':'.jpg','image/webp':'.webp',
@@ -175,6 +195,36 @@ function updateMeta(){
 
 function setBlobMode(on){ blobMode = on; revokeAll(); load(); }
 
+function setLocked(on){
+  document.getElementById('login').style.display = on ? 'block' : 'none';
+  document.getElementById('tools').style.display = on ? 'none' : 'flex';
+  if(on) document.getElementById('grid').replaceChildren();
+}
+
+function showLogin(msg){
+  setLocked(true);
+  document.getElementById('pwerr').textContent = msg;
+  document.getElementById('pw').focus();
+}
+
+async function login(){
+  const pw = document.getElementById('pw');
+  document.getElementById('pwerr').textContent = 'checking...';
+  let r;
+  try{
+    r = await fetch('login', {method:'POST', headers:{'Content-Type':'application/json'},
+                              body: JSON.stringify({password: pw.value})});
+  }catch(e){ showLogin('could not reach ComfyUI'); return; }
+  if(!r.ok){ pw.select(); showLogin('wrong password'); return; }
+  pw.value = '';
+  setLocked(false);
+  load();
+}
+
+document.getElementById('pw').addEventListener('keydown', e => {
+  if(e.key === 'Enter') login();
+});
+
 async function hydrate(card, it){
   if(!blobMode || held.has(it.id)) return;
   try{
@@ -197,10 +247,8 @@ async function load(){
   let r;
   try { r = await fetch(tok('list'),{cache:'no-store'}); }
   catch(e){ grid.innerHTML='<div class="empty">could not reach ComfyUI</div>'; return; }
-  if(r.status === 403){
-    grid.innerHTML='<div class="empty">missing or bad token &mdash; open the '
-      +'gallery URL printed in the ComfyUI log</div>'; return;
-  }
+  if(r.status === 403){ showLogin(''); return; }
+  setLocked(false);
   try { listing = await r.json(); }
   catch(e){ grid.innerHTML='<div class="empty">could not read the listing</div>'; return; }
 
@@ -275,18 +323,53 @@ def _same_origin(request):
     return origin.split("://", 1)[-1] == request.headers.get("Host", "")
 
 
+def _secret_eq(a, b):
+    """compare_digest rejects non-ASCII str, and a password may well be."""
+    return hmac.compare_digest(str(a).encode("utf-8"), str(b).encode("utf-8"))
+
+
 def _guard(request, need_token=True):
     """-> a Response to return immediately, or None to carry on. Blob reads skip
-    the token: the node's widget only ever knows the id, and a uuid4 is not
+    the password: the node's widget only ever knows the id, and a uuid4 is not
     enumerable without /list."""
     if not _same_origin(request):
         return web.Response(status=403, text="cross-origin request refused")
     if need_token and TOKEN:
+        if _secret_eq(request.cookies.get(COOKIE, ""), _SESSION):
+            return None
         got = (request.rel_url.query.get("t")
                or request.headers.get("X-Inline-Preview-Token", ""))
-        if not hmac.compare_digest(got, TOKEN):
-            return web.Response(status=403, text="missing or bad token")
+        if not _secret_eq(got, TOKEN):
+            return web.Response(status=403, text="locked")
     return None
+
+
+@PromptServer.instance.routes.post("/inline_preview/login")
+async def _inline_preview_login(request):
+    global _fails
+    if not _same_origin(request):
+        return web.Response(status=403, text="cross-origin request refused")
+    if not TOKEN:
+        return web.json_response({"ok": True})
+
+    try:
+        given = (await request.json()).get("password", "")
+    except Exception:
+        given = ""
+
+    if not _secret_eq(given, TOKEN):
+        _fails += 1
+        # No rate limiter in front of this, so make guessing cost wall time.
+        await asyncio.sleep(min(2.0, 0.25 * _fails))
+        return web.json_response({"ok": False}, status=403)
+
+    _fails = 0
+    resp = web.json_response({"ok": True})
+    # Path-scoped so it never rides along with the rest of ComfyUI's routes;
+    # SameSite=Strict keeps it off cross-site requests even before _same_origin.
+    resp.set_cookie(COOKIE, _SESSION, httponly=True, samesite="Strict",
+                    path="/inline_preview", max_age=COOKIE_MAX_AGE)
+    return resp
 
 
 @PromptServer.instance.routes.get("/inline_preview")
@@ -337,7 +420,9 @@ async def _inline_preview_clear(request):
 
 @PromptServer.instance.routes.get("/inline_preview/gallery")
 async def _inline_preview_gallery(request):
-    deny = _guard(request)
+    # The page itself carries no data -- it asks for the password and then
+    # fetches /list, which is where the check actually bites.
+    deny = _guard(request, need_token=False)
     if deny is not None:
         return deny
     return web.Response(text=_GALLERY_HTML, content_type="text/html",
@@ -636,11 +721,17 @@ class PreviewVideoInline:
         ]}}
 
 
-if TOKEN:
-    log.info("inline_preview: gallery at /inline_preview/gallery?t=%s", TOKEN)
-else:
+if not TOKEN:
     log.warning("inline_preview: INLINE_PREVIEW_TOKEN is empty -- /inline_preview/list "
                 "enumerates every preview id to anyone who reaches the port")
+elif _env_token is None:
+    # Nobody chose this one, so it has to be printed or it is unknowable.
+    log.info("inline_preview: gallery locked with a random password: %s\n"
+             "               open /inline_preview/gallery and paste it, or set "
+             "INLINE_PREVIEW_TOKEN to pick your own", TOKEN)
+else:
+    log.info("inline_preview: gallery locked with INLINE_PREVIEW_TOKEN "
+             "(not logged) -- open /inline_preview/gallery")
 
 try:
     from . import history_redact
