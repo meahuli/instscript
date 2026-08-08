@@ -15,11 +15,13 @@ Password:    INLINE_PREVIEW_TOKEN      env var. The gallery prompts for it and
              at startup, so paste it once); empty = no password at all.
 CORS:        INLINE_PREVIEW_ALLOW_ORIGIN  env var (default: same-origin only)
 Key TTL:     INLINE_PREVIEW_KEY_TTL    seconds the pod may sit IDLE -- queue
-             drained -- before the browser's encryption key is scrubbed
-             (default 300, 0 = never). It does not have to cover how long a
-             generation takes: the key is held while there is work in flight,
-             and the browser re-posts it on the way into every queue. Lower is
-             tighter; 60 is reasonable.
+             drained -- before a browser's upload key is scrubbed (default 300).
+             It does not have to cover how long a generation takes: keys are
+             held while there is work in flight, and the browser re-posts on the
+             way into every queue. Lower is tighter; 1 is the tightest useful
+             value, since the sweeper floors its interval at 5s.
+             NOTE 0 means NEVER SCRUBBED, not "scrub immediately" -- it pins
+             every posted key in RAM for the life of the process.
 """
 
 import io
@@ -77,34 +79,45 @@ except ImportError:
 # No key -> blobs are stored as-is and the password is the only thing in front.
 KEY_TTL = int(os.environ.get("INLINE_PREVIEW_KEY_TTL", "300"))
 
-_session_key = None      # bytearray, so the long-lived copy can be overwritten
-_session_kid = ""
-_key_touched = 0.0
+# Held per-kid rather than in one global slot. Two browsers -- or a normal
+# window and an incognito one, which have separate localStorage -- each post
+# their own, and a graph decrypting an upload needs back the exact key that
+# upload was sealed with. With a single slot, whichever browser posted last
+# silently broke the other one's run, and `status` is broadcast to every tab so
+# they traded the slot on every socket tick.
+_keys = {}               # kid -> [bytearray key, float touched]
 _key_lock = threading.Lock()
+
+# Nothing but the password gates POST /inline_preview/key, so bound what a
+# client that keeps posting fresh keys can make us hold.
+MAX_KEYS = 8
 
 
 def _kid(key):
     return hashlib.sha256(bytes(key)).hexdigest()[:16]
 
 
-def _zero_locked():
-    """Caller holds _key_lock. Only scrubs the copy we own -- the transient
-    bytes handed to OpenSSL, and whatever the JSON parser made of the request
-    body, are immutable and left to the GC. Nothing here is mlock'd either."""
-    global _session_key, _session_kid
-    if _session_key is not None:
-        for i in range(len(_session_key)):
-            _session_key[i] = 0
-    _session_key = None
-    _session_kid = ""
+def _zero_locked(kid=None):
+    """Caller holds _key_lock; kid=None means all of them. Only scrubs the
+    copies we own -- the transient bytes handed to OpenSSL, and whatever the
+    JSON parser made of the request body, are immutable and left to the GC.
+    Nothing here is mlock'd either."""
+    for k in ([kid] if kid is not None else list(_keys)):
+        entry = _keys.pop(k, None)
+        if entry is None:
+            continue
+        buf = entry[0]
+        for i in range(len(buf)):
+            buf[i] = 0
 
 
-def forget_key(why):
+def forget_key(why, kid=None):
     with _key_lock:
-        had = _session_key is not None
-        _zero_locked()
+        had = kid in _keys if kid is not None else bool(_keys)
+        _zero_locked(kid)
     if had:
-        log.info("inline_preview: session key forgotten (%s)", why)
+        log.info("inline_preview: session key %s forgotten (%s)",
+                 kid[:8] if kid else "(all)", why)
 
 
 def _queue_busy():
@@ -117,39 +130,62 @@ def _queue_busy():
         return True   # unsure -> keep the key rather than silently drop to plaintext
 
 
-def _live_key():
-    """None once the pod has been idle past the TTL, so a pod nobody is using
-    holds no key at all."""
+def _stale(entry, now):
+    return bool(KEY_TTL) and now - entry[1] > KEY_TTL
+
+
+def _key_for(kid):
+    """The key `kid` names, or None once it has aged out. Exact match only: an
+    upload sealed under one browser's key is not readable with another's, and
+    substituting the newest would hand the graph a decrypt failure in place of a
+    message saying which browser to go back to."""
+    if not kid:
+        return None
     with _key_lock:
-        if _session_key is None:
+        entry = _keys.get(kid)
+        if entry is None:
             return None
-        live = (bytes(_session_key), _session_kid)
-        stale = bool(KEY_TTL) and time.time() - _key_touched > KEY_TTL
-    if not stale:
-        return live
+        if not _stale(entry, time.time()):
+            entry[1] = time.time()
+            return bytes(entry[0])
     # Lock released before touching the queue -- never hold two at once.
     if _queue_busy():
-        return live
-    with _key_lock:
-        if _session_key is None:
-            return None
-        _zero_locked()
-    log.info("inline_preview: session key scrubbed after %ds idle", KEY_TTL)
+        with _key_lock:
+            entry = _keys.get(kid)
+            if entry is None:
+                return None
+            entry[1] = time.time()
+            return bytes(entry[0])
+    forget_key("idle %ds" % KEY_TTL, kid)
     return None
 
 
+def _newest_key():
+    """-> (key, kid) for whichever browser posted most recently. Outputs go
+    under that one, which is the behaviour this has always had; uploads do NOT
+    come through here, because they name the key they need by kid."""
+    with _key_lock:
+        newest = max(_keys.items(), key=lambda kv: kv[1][1], default=None)
+    if newest is None:
+        return None
+    key = _key_for(newest[0])
+    return None if key is None else (key, newest[0])
+
+
 def _key_sweeper():
-    """_live_key() only runs when something encrypts, so on its own the key
-    would sit in RAM untouched for exactly as long as the pod is idle -- which
-    is the case the TTL exists for. This is what actually scrubs it."""
+    """_key_for() only runs when something encrypts or decrypts, so on its own a
+    key would sit in RAM untouched for exactly as long as the pod is idle --
+    which is the case the TTL exists for. This is what actually scrubs it."""
     interval = max(5, min(30, KEY_TTL // 2))
     while True:
         time.sleep(interval)
         try:
+            now = time.time()
             with _key_lock:
-                idle = _session_key is not None and time.time() - _key_touched > KEY_TTL
+                idle = [k for k, e in _keys.items() if _stale(e, now)]
             if idle and not _queue_busy():
-                forget_key("idle %ds" % KEY_TTL)
+                for k in idle:
+                    forget_key("idle %ds" % KEY_TTL, k)
         except Exception:
             pass
 
@@ -164,39 +200,39 @@ def _await_key(kid, timeout):
     thread means the server loop keeps serving, so waiting here actually lets
     that POST land. The queue is busy throughout, so the key cannot be scrubbed
     out from under us."""
-    live = _live_key()
-    if live is not None and live[1] == kid:
-        return live
+    key = _key_for(kid)
+    if key is not None:
+        return key
 
-    log.info("inline_preview: waiting up to %.0fs for the browser to hand over its key", timeout)
+    log.info("inline_preview: waiting up to %.0fs for the browser to hand over key %s",
+             timeout, kid[:8])
     deadline = time.time() + timeout
     while time.time() < deadline:
         time.sleep(0.1)
-        live = _live_key()
-        if live is not None and live[1] == kid:
-            return live
-    return live
+        key = _key_for(kid)
+        if key is not None:
+            return key
+    return None
 
 
 def _decrypt_input(blob, kid):
     """Inputs must come back in the clear HERE, not in the browser, because the
     graph needs a tensor. The browser re-posts its key on execution_start and
     _queue_busy() holds it for the run, so the key is present exactly when this
-    needs it -- but say plainly what to do when it is not."""
+    needs it -- but say plainly what to do when it is not.
+
+    Every posted key is kept, so another browser queueing in parallel no longer
+    displaces the one this upload needs; a miss now means that browser has not
+    posted at all, not that it lost a race."""
     if not kid:
         return blob
-    live = _await_key(kid, KEY_WAIT)
-    if live is None:
+    key = _await_key(kid, KEY_WAIT)
+    if key is None:
         raise ValueError(
-            "LoadImageInline: this image is encrypted and no session key is loaded. "
-            "Open ComfyUI in the browser that uploaded it and queue again -- it "
-            "hands the key over on every run.")
-    key, current = live
-    if current != kid:
-        raise ValueError(
-            "LoadImageInline: this image was encrypted with a different key (%s, "
-            "loaded %s). Whichever browser uploaded it must be the one that queues, "
-            "or re-upload it here." % (kid[:8], current[:8]))
+            "LoadImageInline: this image is encrypted under key %s, which no browser "
+            "has handed over. Open ComfyUI in the browser that uploaded it and queue "
+            "again -- it posts its key on every run -- or re-upload the image here."
+            % kid[:8])
     try:
         return AESGCM(key).decrypt(bytes(blob[:12]), bytes(blob[12:]), None)
     except Exception as e:
@@ -271,14 +307,13 @@ def _warn_once(tag, msg):
 def _encrypt(data):
     """-> (blob, kid). AES-GCM with a fresh 96-bit nonce per blob, prepended.
     Distinct nonces under one key are what keeps GCM safe across many blobs."""
-    global _key_touched
     if AESGCM is None:
         _warn_once("nocrypto",
                    "inline_preview: cryptography is not installed, so previews are stored "
                    "UNENCRYPTED (the password still gates them). Re-run provision.sh, or "
                    "pip install cryptography, and restart.")
         return data, ""
-    live = _live_key()
+    live = _newest_key()
     if live is None:
         _warn_once("nokey",
                    "inline_preview: no session key has been posted, so previews are stored "
@@ -287,8 +322,6 @@ def _encrypt(data):
                    "so a locked tab cannot hand its key over.")
         return data, ""
     key, kid = live
-    with _key_lock:
-        _key_touched = time.time()
     nonce = os.urandom(12)
     return nonce + AESGCM(key).encrypt(nonce, data, None), kid
 
@@ -761,9 +794,9 @@ def _with_cookie(resp):
 
 @PromptServer.instance.routes.post("/inline_preview/key")
 async def _inline_preview_key(request):
-    """Take the browser's session key. Authenticated, so the password is what
-    stops anyone else from swapping the key out from under you."""
-    global _session_key, _session_kid, _key_touched
+    """Take a browser's session key. Authenticated, so the password is what
+    stops anyone else from adding one. Keys accumulate rather than replacing
+    each other, so a second browser no longer takes the slot from the first."""
     deny = _guard(request)
     if deny is not None:
         return deny
@@ -776,17 +809,22 @@ async def _inline_preview_key(request):
     if len(raw) != 32:
         return web.json_response({"ok": False, "reason": "bad-key"}, status=400)
 
+    kid = _kid(raw)
     with _key_lock:
-        fresh = _session_key is None or bytes(_session_key) != raw
+        entry = _keys.get(kid)
+        fresh = entry is None
         if fresh:
-            _zero_locked()
-            _session_key = bytearray(raw)
-            _session_kid = _kid(raw)
-        _key_touched = time.time()
-        kid = _session_kid
+            # Oldest first, so the browser that just spoke is never the one dropped.
+            while len(_keys) >= MAX_KEYS:
+                _zero_locked(min(_keys.items(), key=lambda kv: kv[1][1])[0])
+            _keys[kid] = [bytearray(raw), time.time()]
+        else:
+            entry[1] = time.time()
+        held = len(_keys)
     if fresh:
         _warned.discard("nokey")   # so a later lapse warns again rather than staying quiet
-        log.info("inline_preview: session key set (kid %s) -- new previews are encrypted", kid)
+        log.info("inline_preview: session key set (kid %s, %d held) -- new previews "
+                 "are encrypted", kid, held)
     return web.json_response({"ok": True, "kid": kid, "ttl": KEY_TTL})
 
 
@@ -1229,8 +1267,9 @@ if KEY_TTL:
     threading.Thread(target=_key_sweeper, daemon=True,
                      name="inline_preview_key_sweeper").start()
 else:
-    log.warning("inline_preview: INLINE_PREVIEW_KEY_TTL=0 -- the encryption key "
-                "stays in RAM for the life of the process once posted")
+    log.warning("inline_preview: INLINE_PREVIEW_KEY_TTL=0 means NEVER SCRUBBED -- every "
+                "key posted stays in RAM for the life of the process. Set 1, not 0, if "
+                "what you wanted was to drop them as soon as the queue drains.")
 
 if not TOKEN:
     log.warning("inline_preview: INLINE_PREVIEW_TOKEN is empty -- /inline_preview/list "
