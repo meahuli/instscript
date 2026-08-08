@@ -169,12 +169,14 @@ class BlobStore:
         self.max_bytes = max_bytes
         self._items = OrderedDict()
         self._bytes = 0
+        self._seq = 0
         self._lock = threading.Lock()
 
     def put(self, data, content_type, has_audio=False, kid=""):
         key = uuid.uuid4().hex
         with self._lock:
-            self._items[key] = (data, content_type, time.time(), has_audio, kid)
+            self._seq += 1
+            self._items[key] = (data, content_type, time.time(), has_audio, kid, self._seq)
             self._bytes += len(data)
             while self._bytes > self.max_bytes and len(self._items) > 1:
                 _, evicted = self._items.popitem(last=False)
@@ -198,16 +200,21 @@ class BlobStore:
 
     def listing(self):
         """Newest first. The store is the source of truth -- unlike prompt
-        history, which keeps ids long after their bytes have been evicted."""
+        history, which keeps ids long after their bytes have been evicted.
+
+        Sorted on the put sequence, NOT on dict order: get() moves entries to
+        the end to drive LRU eviction, so dict order is most-recently-viewed,
+        and reading the gallery would shuffle itself. Not on the timestamp
+        either -- wall clock ties within a batch, and NTP can step it back."""
         now = time.time()
         with self._lock:
+            rows = sorted(self._items.items(), key=lambda kv: kv[1][5], reverse=True)
             items = [
                 {"id": k, "type": v[1], "bytes": len(v[0]), "age": round(now - v[2], 1),
                  "audio": v[3], "kid": v[4]}
-                for k, v in self._items.items()
+                for k, v in rows
             ]
-        items.reverse()
-        return {"items": items, "bytes": self._bytes, "max_bytes": self.max_bytes}
+            return {"items": items, "bytes": self._bytes, "max_bytes": self.max_bytes}
 
     def stats(self):
         with self._lock:
