@@ -34,6 +34,7 @@ import logging
 import secrets
 import threading
 from fractions import Fraction
+from urllib.parse import unquote
 from collections import OrderedDict
 
 import numpy as np
@@ -308,11 +309,12 @@ class BlobStore:
         self._seq = 0
         self._lock = threading.Lock()
 
-    def put(self, data, content_type, has_audio=False, kid=""):
+    def put(self, data, content_type, has_audio=False, kid="", name=""):
         key = uuid.uuid4().hex
         with self._lock:
             self._seq += 1
-            self._items[key] = (data, content_type, time.time(), has_audio, kid, self._seq)
+            self._items[key] = (data, content_type, time.time(), has_audio, kid,
+                                self._seq, name)
             self._bytes += len(data)
             while self._bytes > self.max_bytes and len(self._items) > 1:
                 _, evicted = self._items.popitem(last=False)
@@ -347,7 +349,7 @@ class BlobStore:
             rows = sorted(self._items.items(), key=lambda kv: kv[1][5], reverse=True)
             items = [
                 {"id": k, "type": v[1], "bytes": len(v[0]), "age": round(now - v[2], 1),
-                 "audio": v[3], "kid": v[4]}
+                 "audio": v[3], "kid": v[4], "name": v[6]}
                 for k, v in rows
             ]
             return {"items": items, "bytes": self._bytes, "max_bytes": self.max_bytes}
@@ -883,8 +885,17 @@ async def _inline_input_put(request):
             return web.json_response({"ok": False, "reason": "not-an-image"}, status=415)
         ctype = request.headers.get("Content-Type", "image/png").split(";")[0].strip()
 
-    return web.json_response({"ok": True, "id": INPUTS.put(data, ctype, False, kid),
-                              "bytes": len(data), "kid": kid})
+    name = unquote(request.headers.get("X-Inline-Name", ""))[:120]
+    return web.json_response({"ok": True, "kid": kid, "bytes": len(data),
+                              "id": INPUTS.put(data, ctype, False, kid, name)})
+
+
+@PromptServer.instance.routes.get("/inline_input/list")
+async def _inline_input_list(request):
+    deny = _guard(request)
+    if deny is not None:
+        return deny
+    return web.json_response(INPUTS.listing())
 
 
 @PromptServer.instance.routes.get("/inline_input")

@@ -241,6 +241,7 @@ async function upload(node, file, ui) {
   try {
     const { body, kid } = await sealForUpload(file);
     const headers = { "Content-Type": file.type || "application/octet-stream" };
+    headers["X-Inline-Name"] = encodeURIComponent(file.name || "image");
     if (kid) {
       headers["X-Inline-Kid"] = kid;
       headers["X-Inline-Type"] = file.type || "image/png";
@@ -263,6 +264,7 @@ async function upload(node, file, ui) {
   if (w) w.value = d.id;
   // Get the key over now rather than racing the first queue for it.
   if (d.kid) publishKey(true);
+  refreshPicker(ui);
   // Draw from the local File. Re-fetching what we just sent would double the
   // traffic over the tunnel, which is the slow part of this whole operation.
   show(node, ui, d.id,
@@ -311,6 +313,28 @@ async function show(node, ui, id, label, localFile) {
   if (label) ui.status.textContent = label;
 }
 
+// What is already in the RAM store, so a second node does not mean a second
+// upload of the same file over a slow link.
+async function refreshPicker(ui) {
+  const keep = ui.sel.value;
+  let items = [];
+  try {
+    const r = await fetch(api.apiURL("/inline_input/list"), { cache: "no-store" });
+    if (r.ok) items = (await r.json()).items || [];
+    else if (r.status === 403) {
+      ui.sel.replaceChildren(new Option("locked — unlock the gallery first", ""));
+      return;
+    }
+  } catch (e) { return; }
+
+  ui.sel.replaceChildren(
+    new Option(items.length ? `— reuse an upload (${items.length}) —` : "— nothing uploaded yet —", ""),
+    ...items.map(it => new Option(
+      `${it.name || "image"} · ${human(it.bytes)} · ${ago(it.age)}${it.kid ? "" : " · plain"}`,
+      it.id)));
+  if (keep) ui.sel.value = keep;
+}
+
 function buildUploader(node) {
   const el = container();
   el.style.justifyContent = "flex-start";
@@ -333,9 +357,23 @@ function buildUploader(node) {
   btn.style.cssText = "background:#1e1e1e;color:#ddd;border:1px solid #333;"
                     + "border-radius:4px;padding:5px 11px;font:11px sans-serif;cursor:pointer";
 
-  const ui = { img, status };
+  // Names only, no thumbnail grid: every thumbnail would cross the tunnel, and
+  // that is exactly the slow part. One image loads once you pick it.
+  const sel = document.createElement("select");
+  sel.style.cssText = "width:100%;background:#161616;color:#ddd;border:1px solid #333;"
+                    + "border-radius:4px;padding:4px;font:11px sans-serif";
+
+  const ui = { img, status, sel };
   btn.onclick = () => pick.click();
   pick.onchange = () => { upload(node, pick.files?.[0], ui); pick.value = ""; };
+  sel.onmousedown = () => refreshPicker(ui);
+  sel.onchange = () => {
+    const id = sel.value;
+    if (!id) return;
+    const w = node.widgets?.find(x => x.name === "image_id");
+    if (w) w.value = id;
+    show(node, ui, id, sel.options[sel.selectedIndex]?.textContent || "");
+  };
 
   el.addEventListener("dragover", e => { e.preventDefault(); el.style.outline = "1px dashed #567"; });
   el.addEventListener("dragleave", () => { el.style.outline = "none"; });
@@ -351,7 +389,8 @@ function buildUploader(node) {
   });
   el.tabIndex = 0;   // so the element can receive paste
 
-  el.append(img, status, btn, pick);
+  el.append(img, status, btn, sel, pick);
+  refreshPicker(ui);
   return { el, ui };
 }
 
