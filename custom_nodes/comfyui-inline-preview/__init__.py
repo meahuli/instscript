@@ -522,6 +522,14 @@ _GALLERY_HTML = """<!doctype html>
       gap:8px;padding:7px 9px;font-size:11px;color:#8a8a8a}
  .row a{color:#7db3e8;text-decoration:none}
  .row a:hover{text-decoration:underline}
+ /* Both states are stated outright. Marking only the unencrypted ones made a
+    plaintext card look identical to a sealed one at a glance, which is exactly
+    how a whole session of them went unnoticed. */
+ .seal{font-size:10px;padding:1px 6px;border-radius:9px;border:1px solid;
+       white-space:nowrap;flex:0 0 auto;letter-spacing:.02em}
+ .seal.ok{color:#8fc98f;border-color:#2f5c2f;background:#16241a}
+ .seal.no{color:#e08585;border-color:#6a2a2a;background:#2a1616;font-weight:600}
+ #meta .clear{color:#e08585;font-weight:600}
  .empty{color:#666;padding:32px 0;text-align:center}
  label.tog{color:#888;font-size:12px;display:flex;align-items:center;gap:5px;
            cursor:pointer;user-select:none}
@@ -659,10 +667,21 @@ async function drop(it, card){
 }
 
 function updateMeta(){
-  document.getElementById('meta').textContent =
+  const m = document.getElementById('meta');
+  m.textContent =
     listing.items.length+' items \\u00b7 '+human(listing.bytes)+' / '
     +human(listing.max_bytes)
     +(blobMode && heldBytes ? ' \\u00b7 '+human(heldBytes)+' held in browser' : '');
+  // A running count, so leftover plaintext is visible without scanning cards.
+  const clear = listing.items.filter(x => !x.kid).length;
+  if(clear){
+    const w = document.createElement('span');
+    w.className = 'clear';
+    w.textContent = ' \\u00b7 '+clear+' stored UNENCRYPTED';
+    w.title = 'These predate a working key, or were made while none was registered. '
+            + 'Re-queue to regenerate them sealed, or clear the store.';
+    m.appendChild(w);
+  }
 }
 
 function setBlobMode(on){ blobMode = on; revokeAll(); load(); }
@@ -781,13 +800,22 @@ async function load(){
     const row = document.createElement('div');
     row.className = 'row';
     const span = document.createElement('span');
-    span.textContent = human(it.bytes)+' \\u00b7 '+ago(it.age)
-      + (it.kid ? '' : ' \\u00b7 plain');
+    span.textContent = human(it.bytes)+' \\u00b7 '+ago(it.age);
+
+    const seal = document.createElement('span');
+    seal.className = 'seal ' + (it.kid ? 'ok' : 'no');
+    seal.textContent = it.kid ? 'sealed '+it.kid.slice(0,6) : 'CLEAR';
+    seal.title = it.kid
+      ? 'Encrypted. A one-time AES key wrapped to public key '+it.kid
+        +' -- only the browser holding that private key can open it.'
+      : 'NOT encrypted. Held in RAM as-is, so anyone who can reach this port '
+        +'with the password can read it. Re-queue to regenerate a sealed copy.';
+
     const a = document.createElement('a');
     a.href = url;
     a.download = 'preview-'+it.id.slice(0,8)+(EXT[it.type]||'');
     a.textContent = 'save';
-    row.append(span, a);
+    row.append(span, seal, a);
 
     // Deliberately in the far corner rather than beside "save" -- one is
     // irreversible and the store is the only copy.
