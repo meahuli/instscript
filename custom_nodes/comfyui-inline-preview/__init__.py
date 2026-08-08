@@ -391,11 +391,26 @@ function revokeAll(){
 async function drop(it, card){
   if(!confirm('Delete this preview? It only exists in RAM, so it cannot be recovered.'))
     return;
-  let r;
+  const fail = msg => {
+    const s = card.querySelector('.row span');
+    if(s) s.textContent = msg;          // leave the card: it is still on the server
+  };
+
+  let r, d = null;
   try{ r = await fetch(tok('delete?id='+encodeURIComponent(it.id)), {method:'POST'}); }
-  catch(e){ return; }
+  catch(e){ fail('delete failed: could not reach ComfyUI'); return; }
   if(r.status === 403){ showLogin('session expired'); return; }
-  if(!r.ok && r.status !== 404) return;   // 404: already gone, so we are done
+  try{ d = await r.json(); }catch(e){}
+
+  // Our handler always answers with JSON carrying "ok", so a 404 WITH that body
+  // means the blob was already gone and the caller got what it wanted. A bare
+  // 404 means the route is not registered -- an older node still running -- and
+  // dropping the card there would claim a deletion that never happened.
+  if(!r.ok && !(r.status === 404 && d && 'ok' in d)){
+    fail(r.status === 404 ? 'delete unsupported \\u2014 node needs redeploying'
+                          : 'delete failed (HTTP '+r.status+')');
+    return;
+  }
 
   const h = held.get(it.id);
   if(h){ URL.revokeObjectURL(h.url); heldBytes -= h.size; held.delete(it.id); }
