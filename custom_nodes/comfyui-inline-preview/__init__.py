@@ -142,7 +142,7 @@ def forget_key(why, kid=None):
         had = kid in _keys if kid is not None else bool(_keys)
         _zero_locked(kid)
     if had:
-        log.info("inline_preview: session key %s forgotten (%s)",
+        log.info("inline_preview: upload key %s forgotten (%s)",
                  kid[:8] if kid else "(all)", why)
 
 
@@ -888,7 +888,8 @@ def _with_cookie(resp):
 
 @PromptServer.instance.routes.post("/inline_preview/key")
 async def _inline_preview_key(request):
-    """Take a browser's session key. Authenticated, so the password is what
+    """Take a browser's upload key -- symmetric, because a graph needs a tensor.
+    Previews do NOT use this. Authenticated, so the password is what
     stops anyone else from adding one. Keys accumulate rather than replacing
     each other, so a second browser no longer takes the slot from the first."""
     deny = _guard(request)
@@ -916,9 +917,14 @@ async def _inline_preview_key(request):
             entry[1] = time.time()
         held = len(_keys)
     if fresh:
-        _warned.discard("nokey")   # so a later lapse warns again rather than staying quiet
-        log.info("inline_preview: session key set (kid %s, %d held) -- new previews "
-                 "are encrypted", kid, held)
+        # Says UPLOADS, not previews. Previews are sealed to a public key and do
+        # not touch this key at all -- claiming otherwise here sent someone
+        # hunting for a preview bug while the real problem was that no browser
+        # had ever reached POST /inline_preview/pubkey. The "nokey" warn-once tag
+        # belongs to that route for the same reason: it is not this key's to clear.
+        log.info("inline_preview: upload key set (kid %s, %d held) -- uploads from "
+                 "this browser can be decrypted. Previews are sealed separately, to a "
+                 "public key; look for 'public key registered' for those.", kid, held)
     return web.json_response({"ok": True, "kid": kid, "ttl": KEY_TTL})
 
 
