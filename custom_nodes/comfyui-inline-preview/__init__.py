@@ -21,7 +21,9 @@ import os
 import hmac
 import time
 import uuid
+import base64
 import asyncio
+import hashlib
 import logging
 import secrets
 import threading
@@ -47,6 +49,31 @@ COOKIE_MAX_AGE = 12 * 3600
 _SESSION = secrets.token_urlsafe(24)
 _fails = 0
 
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+except ImportError:
+    AESGCM = None
+
+# Posted once per browser session over an authenticated route, never served
+# back, never written anywhere. No key -> blobs are stored as-is and the
+# password is the only thing in front of them.
+_session_key = None
+_session_kid = ""
+
+
+def _kid(key):
+    return hashlib.sha256(key).hexdigest()[:16]
+
+
+def _encrypt(data):
+    """-> (blob, kid). AES-GCM with a fresh 96-bit nonce per blob, prepended.
+    Distinct nonces under one key are what keeps GCM safe across many blobs."""
+    key = _session_key
+    if key is None or AESGCM is None:
+        return data, ""
+    nonce = os.urandom(12)
+    return nonce + AESGCM(key).encrypt(nonce, data, None), _session_kid
+
 _EXT = {
     "image/png": ".png",
     "image/jpeg": ".jpg",
@@ -63,10 +90,10 @@ class BlobStore:
         self._bytes = 0
         self._lock = threading.Lock()
 
-    def put(self, data, content_type, has_audio=False):
+    def put(self, data, content_type, has_audio=False, kid=""):
         key = uuid.uuid4().hex
         with self._lock:
-            self._items[key] = (data, content_type, time.time(), has_audio)
+            self._items[key] = (data, content_type, time.time(), has_audio, kid)
             self._bytes += len(data)
             while self._bytes > self.max_bytes and len(self._items) > 1:
                 _, evicted = self._items.popitem(last=False)
@@ -87,7 +114,7 @@ class BlobStore:
         with self._lock:
             items = [
                 {"id": k, "type": v[1], "bytes": len(v[0]), "age": round(now - v[2], 1),
-                 "audio": v[3]}
+                 "audio": v[3], "kid": v[4]}
                 for k, v in self._items.items()
             ]
         items.reverse()
@@ -171,9 +198,50 @@ const human = b => { const u=['B','KB','MB','GB']; let i=0,n=b;
   while(n>=1024&&i<u.length-1){n/=1024;i++;} return n.toFixed(n<10&&i>0?1:0)+' '+u[i]; };
 const ago = s => s<60?Math.round(s)+'s ago'
   : s<3600?Math.round(s/60)+'m ago' : (s/3600).toFixed(1)+'h ago';
-const srcOf = it => '../inline_preview?id='+encodeURIComponent(it.id);
+const srcOf = it => tok('../inline_preview?id='+encodeURIComponent(it.id));
 const TOK = new URLSearchParams(location.search).get('t') || '';
 const tok = p => TOK ? p+(p.includes('?')?'&':'?')+'t='+encodeURIComponent(TOK) : p;
+
+// Same origin as the ComfyUI tab, so this is the very same key it generated.
+const KEY_ITEM = 'inline_preview_session_key';
+const b64 = b => btoa(String.fromCharCode(...new Uint8Array(b)));
+const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+let keyBytes = null, keyPublished = false;
+
+function sessionKey(){
+  if(keyBytes) return keyBytes;
+  if(!globalThis.crypto?.subtle) return null;
+  let s = localStorage.getItem(KEY_ITEM);
+  if(!s){ s = b64(crypto.getRandomValues(new Uint8Array(32)));
+          localStorage.setItem(KEY_ITEM, s); }
+  keyBytes = unb64(s);
+  return keyBytes;
+}
+
+async function kidOf(raw){
+  const h = await crypto.subtle.digest('SHA-256', raw);
+  return [...new Uint8Array(h)].map(b=>b.toString(16).padStart(2,'0')).join('').slice(0,16);
+}
+
+async function publishKey(){
+  if(keyPublished) return;
+  const raw = sessionKey();
+  if(!raw) return;
+  try{
+    const r = await fetch(tok('key'), {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({key: b64(raw)})});
+    keyPublished = r.ok;
+  }catch(e){}
+}
+
+async function decryptBlob(buf, it){
+  if(!it.kid) return buf;
+  const raw = sessionKey();
+  if(!raw) throw new Error('nokey');
+  if(await kidOf(raw) !== it.kid) throw new Error('otherkey');
+  const ck = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['decrypt']);
+  return crypto.subtle.decrypt({name:'AES-GCM', iv: buf.slice(0,12)}, ck, buf.slice(12));
+}
 
 let blobMode = true;
 const held = new Map();
@@ -225,19 +293,27 @@ document.getElementById('pw').addEventListener('keydown', e => {
   if(e.key === 'Enter') login();
 });
 
+const CRYPTMSG = {nokey:'no key in this browser', otherkey:'different session key'};
+
 async function hydrate(card, it){
-  if(!blobMode || held.has(it.id)) return;
+  if(held.has(it.id)) return;
   try{
     const r = await fetch(srcOf(it), {cache:'no-store'});
-    if(!r.ok) return;
-    const b = await r.blob();
-    if(!blobMode || !card.isConnected) return;
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const b = new Blob([await decryptBlob(await r.arrayBuffer(), it)], {type: it.type});
+    if(!card.isConnected) return;
     const o = URL.createObjectURL(b);
     held.set(it.id, o); heldBytes += b.size;
     const m = card.querySelector('img,video'); if(m) m.src = o;
     const a = card.querySelector('a');         if(a) a.href = o;
     updateMeta();
-  }catch(e){}
+  }catch(e){
+    const m = card.querySelector('img,video');
+    if(m) m.replaceWith(Object.assign(document.createElement('div'), {
+      textContent: CRYPTMSG[e.message] || 'could not load',
+      style: 'aspect-ratio:1;display:flex;align-items:center;justify-content:center;'
+           + 'background:#000;color:#c88;font-size:11px;text-align:center;padding:8px'}));
+  }
 }
 
 async function load(){
@@ -249,6 +325,7 @@ async function load(){
   catch(e){ grid.innerHTML='<div class="empty">could not reach ComfyUI</div>'; return; }
   if(r.status === 403){ showLogin(''); return; }
   setLocked(false);
+  publishKey();
   try { listing = await r.json(); }
   catch(e){ grid.innerHTML='<div class="empty">could not read the listing</div>'; return; }
 
@@ -279,7 +356,10 @@ async function load(){
     } else {
       media.loading = 'lazy';
     }
-    if(!blobMode) media.src = url;
+    // Encrypted bytes can never go straight into src -- they have to come
+    // through JS to be decrypted, whatever the toggle says.
+    const viaJs = blobMode || !!it.kid;
+    if(!viaJs) media.src = url;
 
     const row = document.createElement('div');
     row.className = 'row';
@@ -294,7 +374,7 @@ async function load(){
     card.append(media, row);
     grid.appendChild(card);
     owner.set(card, it);
-    if(blobMode) io.observe(card);
+    if(viaJs) io.observe(card);
   }
 }
 
@@ -364,7 +444,10 @@ async def _inline_preview_login(request):
         return web.json_response({"ok": False}, status=403)
 
     _fails = 0
-    resp = web.json_response({"ok": True})
+    return _with_cookie(web.json_response({"ok": True}))
+
+
+def _with_cookie(resp):
     # Path-scoped so it never rides along with the rest of ComfyUI's routes;
     # SameSite=Strict keeps it off cross-site requests even before _same_origin.
     resp.set_cookie(COOKIE, _SESSION, httponly=True, samesite="Strict",
@@ -372,9 +455,35 @@ async def _inline_preview_login(request):
     return resp
 
 
+@PromptServer.instance.routes.post("/inline_preview/key")
+async def _inline_preview_key(request):
+    """Take the browser's session key. Authenticated, so the password is what
+    stops anyone else from swapping the key out from under you."""
+    global _session_key, _session_kid
+    deny = _guard(request)
+    if deny is not None:
+        return deny
+    if AESGCM is None:
+        return web.json_response({"ok": False, "reason": "no-crypto"}, status=501)
+    try:
+        raw = base64.b64decode((await request.json()).get("key", ""), validate=True)
+    except Exception:
+        raw = b""
+    if len(raw) != 32:
+        return web.json_response({"ok": False, "reason": "bad-key"}, status=400)
+    if raw != _session_key:
+        _session_key = raw
+        _session_kid = _kid(raw)
+        log.info("inline_preview: session key set (kid %s) -- new previews are encrypted",
+                 _session_kid)
+    return web.json_response({"ok": True, "kid": _session_kid})
+
+
 @PromptServer.instance.routes.get("/inline_preview")
 async def _inline_preview(request):
-    deny = _guard(request, need_token=False)
+    # Gated: /history keeps the ui payload intact, so the blob ids are public to
+    # anyone who reaches the port. The id alone must not be enough.
+    deny = _guard(request)
     if deny is not None:
         return deny
     key = request.rel_url.query.get("id", "")
@@ -425,8 +534,13 @@ async def _inline_preview_gallery(request):
     deny = _guard(request, need_token=False)
     if deny is not None:
         return deny
-    return web.Response(text=_GALLERY_HTML, content_type="text/html",
+    resp = web.Response(text=_GALLERY_HTML, content_type="text/html",
                         headers={"Cache-Control": "no-store"})
+    # A valid ?t= counts as logging in. Without minting the cookie here the
+    # ComfyUI tab's widget would have no credential and every preview would 403.
+    if TOKEN and _secret_eq(request.rel_url.query.get("t", ""), TOKEN):
+        resp = _with_cookie(resp)
+    return resp
 
 
 def _to_uint8(images):
@@ -655,7 +769,9 @@ class PreviewImageInline:
         out = []
         for frame in _to_uint8(images):
             data, mime = _encode_still(frame, format, quality)
-            out.append({"id": STORE.put(data, mime), "type": mime, "bytes": len(data)})
+            blob, kid = _encrypt(data)
+            out.append({"id": STORE.put(blob, mime, False, kid), "type": mime,
+                        "bytes": len(blob), "kid": kid})
         return {"ui": {"inline": out}}
 
 
@@ -715,9 +831,11 @@ class PreviewVideoInline:
             data, mime = _encode_animated_webp(arr, rate, quality)
             has_audio = False
 
+        blob, kid = _encrypt(data)
         return {"ui": {"inline": [
-            {"id": STORE.put(data, mime, has_audio), "type": mime, "bytes": len(data),
-             "audio": has_audio, "frames": int(arr.shape[0]), "fps": round(rate, 3)}
+            {"id": STORE.put(blob, mime, has_audio, kid), "type": mime, "bytes": len(blob),
+             "audio": has_audio, "kid": kid,
+             "frames": int(arr.shape[0]), "fps": round(rate, 3)}
         ]}}
 
 

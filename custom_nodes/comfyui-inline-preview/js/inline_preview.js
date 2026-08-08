@@ -11,6 +11,60 @@ const EXT = {
   "video/webm": ".webm",
 };
 
+// The gallery lives on this same origin, so it shares this localStorage entry
+// and needs no key of its own. Incognito wipes it when the last window closes,
+// which strands anything still in the store -- that is the deal with a random
+// per-session key rather than one derived from something you can retype.
+const KEY_ITEM = "inline_preview_session_key";
+
+const b64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+
+let keyBytes = null;
+let keyPublished = false;
+
+function sessionKey() {
+  if (keyBytes) return keyBytes;
+  // crypto.subtle only exists in a secure context: https, or localhost (which
+  // is what the tunnel gives you). Over plain http to an IP it is undefined.
+  if (!globalThis.crypto?.subtle) return null;
+  let stored = localStorage.getItem(KEY_ITEM);
+  if (!stored) {
+    stored = b64(crypto.getRandomValues(new Uint8Array(32)));
+    localStorage.setItem(KEY_ITEM, stored);
+  }
+  keyBytes = unb64(stored);
+  return keyBytes;
+}
+
+async function kidOf(raw) {
+  const h = await crypto.subtle.digest("SHA-256", raw);
+  return [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
+}
+
+async function publishKey() {
+  if (keyPublished) return;
+  const raw = sessionKey();
+  if (!raw) return;
+  try {
+    const r = await fetch(api.apiURL("/inline_preview/key"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: b64(raw) }),
+    });
+    keyPublished = r.ok;   // 403 until this browser is unlocked; retried later
+  } catch (e) {}
+}
+
+async function decryptBlob(buf, item) {
+  if (!item.kid) return buf;
+  const raw = sessionKey();
+  if (!raw) throw new Error("nokey");
+  if (await kidOf(raw) !== item.kid) throw new Error("otherkey");
+  const ck = await crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["decrypt"]);
+  return crypto.subtle.decrypt({ name: "AES-GCM", iv: buf.slice(0, 12) }, ck, buf.slice(12));
+}
+
 function container() {
   const el = document.createElement("div");
   el.style.cssText = [
@@ -46,15 +100,23 @@ function revokeAll(node) {
 async function hydrate(node, item, wrap) {
   const url = api.apiURL(`/inline_preview?id=${encodeURIComponent(item.id)}`);
 
+  const MSG = {
+    expired: "preview expired (evicted from the RAM store) — re-queue to regenerate",
+    locked: "locked — open /inline_preview/gallery?t=<password> once to unlock this browser",
+    nokey: "no decryption key in this browser (needs https or localhost)",
+    otherkey: "encrypted with a key this browser no longer has — re-queue to regenerate",
+  };
+
   let obj;
   try {
     const r = await fetch(url, { cache: "no-store" });
-    if (!r.ok) throw new Error(r.status === 404 ? "expired" : `HTTP ${r.status}`);
-    obj = URL.createObjectURL(await r.blob());
+    if (r.status === 403) { keyPublished = false; throw new Error("locked"); }
+    if (r.status === 404) throw new Error("expired");
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const buf = await decryptBlob(await r.arrayBuffer(), item);
+    obj = URL.createObjectURL(new Blob([buf], { type: item.type }));
   } catch (e) {
-    note(wrap, e.message === "expired"
-      ? "preview expired (evicted from the RAM store) — re-queue to regenerate"
-      : `could not load preview (${e.message})`, "#c88");
+    note(wrap, MSG[e.message] || `could not load preview (${e.message})`, "#c88");
     return;
   }
 
@@ -105,6 +167,7 @@ function render(node, items) {
   const el = node._inlineEl;
   if (!el) return;
 
+  publishKey();   // no-op once accepted; retries after the browser is unlocked
   revokeAll(node);
   el.replaceChildren();
 
@@ -125,6 +188,10 @@ function render(node, items) {
 
 app.registerExtension({
   name: "inline.preview.ram",
+
+  async setup() {
+    publishKey();
+  },
 
   async beforeRegisterNodeDef(nodeType, nodeData) {
     if (!NODES.has(nodeData.name)) return;
