@@ -117,17 +117,34 @@ async function publishPubKey(force) {
   const now = Date.now();
   if (force && now - lastPub < 3000) return;
   lastPub = now;
-  const me = await myPkid();
-  if (!me) return;
+  // Everything is inside the try, and every exit says why. This used to fail
+  // silently: myPkid() was awaited outside it, so any throw in the keypair path
+  // became an unhandled rejection and the only evidence anywhere was a server
+  // log line saying previews were unencrypted.
   try {
+    const me = await myPkid();
+    if (!me) {
+      console.warn("inline_preview: no keypair in this browser — previews will be stored "
+                 + "UNENCRYPTED. Needs a secure context (https or localhost) and IndexedDB "
+                 + "(blocked in some private windows).");
+      return;
+    }
     const r = await fetch(api.apiURL("/inline_preview/pubkey"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ key: b64(me.spki), client_id: api.clientId || "" }),
     });
     pubPublished = r.ok;   // 403 until this browser is unlocked; retried later
-    if (!r.ok) console.warn("inline_preview: pubkey not accepted — previews will be unencrypted");
-  } catch (e) {}
+    if (r.ok) {
+      console.info("inline_preview: public key registered, pkid", me.pkid);
+    } else {
+      console.warn("inline_preview: pubkey rejected (HTTP " + r.status + ") — previews will "
+                 + "be stored UNENCRYPTED.", await r.text().catch(() => ""));
+    }
+  } catch (e) {
+    console.warn("inline_preview: pubkey registration failed — previews will be stored "
+               + "UNENCRYPTED.", e);
+  }
 }
 
 // b"IP1" | uint16 len(wrapped) | wrapped | 12-byte nonce | ciphertext
