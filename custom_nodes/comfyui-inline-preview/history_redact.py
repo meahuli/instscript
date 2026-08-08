@@ -30,7 +30,13 @@ log = logging.getLogger("inline_preview")
 
 ENABLED = os.environ.get("INLINE_PREVIEW_REDACT_HISTORY", "1") not in ("0", "false", "False")
 
-_EXPECTED_PARAMS = ["self", "item_id", "history_result", "status"]
+# All the wrapper needs is (self, item_id) up front -- it looks up the running
+# item by id and forwards everything else untouched. Demanding the full
+# parameter list turned an additive upstream change (ComfyUI grew a
+# process_item argument) into redaction silently switching off, which is the
+# opposite of what a strict check is for. A rename or reorder of these two
+# still trips it, because that would genuinely break the lookup.
+_REQUIRED_PREFIX = ["self", "item_id"]
 
 _QUEUE_GETTERS = ("get_current_queue", "get_current_queue_volatile")
 
@@ -131,13 +137,14 @@ def install():
         params = list(inspect.signature(orig).parameters)
     except (TypeError, ValueError):
         params = None
-    if params != _EXPECTED_PARAMS:
-        log.error("inline_preview: history redaction OFF -- task_done signature is %s, "
-                  "expected %s. ComfyUI internals changed; refusing to patch blindly. "
-                  "Prompts REMAIN readable via GET /history.", params, _EXPECTED_PARAMS)
+    if params is None or params[:2] != _REQUIRED_PREFIX:
+        log.error("inline_preview: history redaction OFF -- task_done starts with %s, "
+                  "expected it to start with %s. ComfyUI internals changed; refusing to "
+                  "patch blindly. Prompts REMAIN readable via GET /history.",
+                  params, _REQUIRED_PREFIX)
         return
 
-    def task_done(self, item_id, history_result, status=None):
+    def task_done(self, item_id, *args, **kwargs):
         global _verified, _broken
 
         prompt_id = None
@@ -149,7 +156,7 @@ def install():
         except Exception as e:
             log.debug("inline_preview: could not read prompt_id (%s)", e)
 
-        orig(self, item_id, history_result, status)
+        orig(self, item_id, *args, **kwargs)
 
         if prompt_id is None:
             if not _broken:
