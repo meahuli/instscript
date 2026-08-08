@@ -49,11 +49,22 @@ echo "==> provider: $PROVIDER"
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# Pinned at 2026-08-08. These run in-process with full access to prompts, images
+# and the encryption key, so an unpinned clone means whatever landed on their
+# default branch since you last provisioned goes straight onto the pod.
+#
+# To update one: check what changed, then bump its sha.
+#   git ls-remote https://github.com/OWNER/REPO HEAD
+# Drop the @sha to track the branch again.
 NODES=(
-  "https://github.com/city96/ComfyUI-GGUF"
-  "https://github.com/Lightricks/ComfyUI-LTXVideo"
-  "https://github.com/ClownsharkBatwing/RES4LYF"
-  "https://github.com/MadiatorLabs/ComfyUI-RunpodDirect"
+  # main   2026-01-12
+  "https://github.com/city96/ComfyUI-GGUF@6ea2651e7df66d7585f6ffee804b20e92fb38b8a"
+  # master 2026-07-27
+  "https://github.com/Lightricks/ComfyUI-LTXVideo@3b9c5cde4700917074823d45e25401d81049f8fc"
+  # main   2026-08-07
+  "https://github.com/ClownsharkBatwing/RES4LYF@26036f647ca15d3048a193daf99a40cecfc3820d"
+  # main   2026-06-29
+  "https://github.com/MadiatorLabs/ComfyUI-RunpodDirect@809065c9d2f3874dc215106784af49f3f0cb368f"
 )
 
 CONSTRAINTS="/tmp/torch-constraints.txt"
@@ -72,7 +83,19 @@ for repo_spec in "${NODES[@]}"; do
   repo="${repo_spec%@*}"; sha=""; [ "$repo_spec" != "$repo" ] && sha="${repo_spec##*@}"
   name=$(basename "$repo" .git)
   if [ -d "$name/.git" ]; then
-    echo "==> [$name] present — skipping clone"
+    # An already-cloned node used to be left alone, so adding a pin did nothing
+    # on a pod that had provisioned before -- it kept whatever it first cloned.
+    at="$(git -C "$name" rev-parse HEAD 2>/dev/null || true)"
+    if [ -n "$sha" ] && [ "$at" != "$sha" ]; then
+      echo "==> [$name] at ${at:0:8}, pinning to ${sha:0:8}"
+      git -C "$name" fetch -q origin "$sha" 2>/dev/null \
+        || git -C "$name" fetch -q --tags origin \
+        || echo "   FETCH FAILED for $name"
+      git -C "$name" checkout -q "$sha" \
+        || echo "   CHECKOUT FAILED for $name — still at ${at:0:8}"
+    else
+      echo "==> [$name] present at ${at:0:8} — skipping clone"
+    fi
   else
     echo "==> [$name] cloning"
     if [ -n "$sha" ]; then
