@@ -261,6 +261,8 @@ async function upload(node, file, ui) {
   }
   const w = node.widgets?.find(x => x.name === "image_id");
   if (w) w.value = d.id;
+  // Get the key over now rather than racing the first queue for it.
+  if (d.kid) publishKey(true);
   // Draw from the local File. Re-fetching what we just sent would double the
   // traffic over the tunnel, which is the slow part of this whole operation.
   show(node, ui, d.id,

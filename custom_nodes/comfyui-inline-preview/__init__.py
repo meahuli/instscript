@@ -153,6 +153,30 @@ def _key_sweeper():
             pass
 
 
+KEY_WAIT = float(os.environ.get("INLINE_KEY_WAIT", "8"))
+
+
+def _await_key(kid, timeout):
+    """A load node runs at the very start of a graph, so it can beat the key POST
+    the browser fires on execution_start -- the first queue after an upload
+    failed while the second succeeded, purely on timing. Executing in a worker
+    thread means the server loop keeps serving, so waiting here actually lets
+    that POST land. The queue is busy throughout, so the key cannot be scrubbed
+    out from under us."""
+    live = _live_key()
+    if live is not None and live[1] == kid:
+        return live
+
+    log.info("inline_preview: waiting up to %.0fs for the browser to hand over its key", timeout)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.1)
+        live = _live_key()
+        if live is not None and live[1] == kid:
+            return live
+    return live
+
+
 def _decrypt_input(blob, kid):
     """Inputs must come back in the clear HERE, not in the browser, because the
     graph needs a tensor. The browser re-posts its key on execution_start and
@@ -160,7 +184,7 @@ def _decrypt_input(blob, kid):
     needs it -- but say plainly what to do when it is not."""
     if not kid:
         return blob
-    live = _live_key()
+    live = _await_key(kid, KEY_WAIT)
     if live is None:
         raise ValueError(
             "LoadImageInline: this image is encrypted and no session key is loaded. "
