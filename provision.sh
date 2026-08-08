@@ -105,6 +105,22 @@ if [ -d "$SELF_DIR/custom_nodes" ]; then
         || echo "   DEP INSTALL FAILED for $n"
     fi
   done
+
+  # pip exiting 0 is not proof the venv can actually use it, and the failure is
+  # silent at runtime: previews and uploads just get stored unencrypted.
+  python - <<'PY'
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    AESGCM(b"0" * 32)
+    print("==> cryptography usable — previews and uploads will be encrypted")
+except Exception as e:
+    print("")
+    print("!!  cryptography is NOT usable in this venv (%s)." % e)
+    print("!!  The nodes still work, but previews and uploads are stored")
+    print("!!  UNENCRYPTED. The gallery password still gates them.")
+    print("!!  Fix with:  pip install cryptography   then restart ComfyUI.")
+    print("")
+PY
 fi
 
 WF_DIR="$COMFY/user/default/workflows"
