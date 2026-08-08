@@ -3,34 +3,63 @@ set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Optional: put this checkout on a branch/tag/sha before installing anything.
-#   PROVISION_REF=some-branch bash /workspace/provision/provision.sh
+# Which revision the pod provisions from. The nodes under custom_nodes/ are
+# installed by copying out of SELF_DIR, not by cloning, so this is the only
+# thing that decides which version of them reaches the pod.
 #
-# The nodes under custom_nodes/ are installed by copying out of SELF_DIR, not by
-# cloning, so which version reaches the pod is decided entirely by what this
-# checkout is on. There is no per-node URL to repoint -- this is that knob.
+#   bash provision.sh                      -> PROVISION_REF_DEFAULT below
+#   PROVISION_REF=other bash provision.sh  -> that branch, tag or sha
+#   PROVISION_REF= bash provision.sh       -> no switch, use what is checked out
 #
+# !! MOVE THIS BACK TO main WHEN inline-preview-pke MERGES. Until then every
+# !! provision is pulled onto the feature branch on purpose. Once it is merged
+# !! this default is actively wrong, and once the branch is deleted it resolves
+# !! to nothing -- which is why an unresolvable DEFAULT only warns and carries
+# !! on, while a ref you asked for explicitly is a hard failure.
+PROVISION_REF_DEFAULT="inline-preview-pke"
+
+if [ -z "${PROVISION_REF+isset}" ]; then
+  PROVISION_REF="$PROVISION_REF_DEFAULT"; PROVISION_REF_SOFT=1
+else
+  PROVISION_REF_SOFT=""
+fi
+
 # Done first and followed by a re-exec, because bash reads a script
 # incrementally: checking out a different version of the file we are currently
 # executing can drop the running shell into the middle of unrelated text.
 # PROVISION_REF_DONE stops the re-exec looping if the ref we land on is older
 # than this block.
 if [ -n "${PROVISION_REF:-}" ] && [ -z "${PROVISION_REF_DONE:-}" ]; then
+  _ref_at() { git -C "$SELF_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown; }
+  _ref_bail() {
+    if [ -n "$PROVISION_REF_SOFT" ]; then
+      echo "!!  $1" >&2
+      echo "!!  staying on $(_ref_at) — set PROVISION_REF explicitly to override." >&2
+    else
+      echo "ERROR: $1" >&2; exit 1
+    fi
+  }
   if [ ! -d "$SELF_DIR/.git" ]; then
-    echo "!!  PROVISION_REF=$PROVISION_REF ignored — $SELF_DIR is not a git checkout." >&2
+    [ -n "$PROVISION_REF_SOFT" ] \
+      || echo "!!  PROVISION_REF=$PROVISION_REF ignored — $SELF_DIR is not a git checkout." >&2
   elif [ -n "$(git -C "$SELF_DIR" status --porcelain 2>/dev/null)" ]; then
-    echo "ERROR: $SELF_DIR has uncommitted changes — refusing to switch to $PROVISION_REF." >&2
-    echo "       Commit, stash or discard them, or unset PROVISION_REF." >&2
-    exit 1
+    _ref_bail "$SELF_DIR has uncommitted changes — refusing to switch to $PROVISION_REF."
+  elif [ "$(_ref_at)" = "$PROVISION_REF" ]; then
+    # Already there. Deliberately no fetch and no checkout -B: re-resetting the
+    # branch on every single provision would discard anything committed here,
+    # and updating is the bootstrap's job (clone || pull), not this block's.
+    echo "==> provision on $PROVISION_REF ($(git -C "$SELF_DIR" rev-parse --short HEAD))"
   else
     echo "==> switching provision checkout to $PROVISION_REF"
     git -C "$SELF_DIR" fetch -q origin || echo "   FETCH FAILED — trying what is already local"
-    git -C "$SELF_DIR" checkout -q -B "$PROVISION_REF" "origin/$PROVISION_REF" 2>/dev/null \
-      || git -C "$SELF_DIR" checkout -q "$PROVISION_REF" \
-      || { echo "ERROR: cannot check out $PROVISION_REF" >&2; exit 1; }
-    echo "==> provision now at $(git -C "$SELF_DIR" rev-parse --short HEAD) ($PROVISION_REF)"
-    export PROVISION_REF_DONE=1
-    exec bash "$0" "$@"
+    if git -C "$SELF_DIR" checkout -q -B "$PROVISION_REF" "origin/$PROVISION_REF" 2>/dev/null \
+       || git -C "$SELF_DIR" checkout -q "$PROVISION_REF" 2>/dev/null; then
+      echo "==> provision now at $(git -C "$SELF_DIR" rev-parse --short HEAD) ($PROVISION_REF)"
+      export PROVISION_REF_DONE=1
+      exec bash "$0" "$@"
+    else
+      _ref_bail "cannot check out $PROVISION_REF"
+    fi
   fi
 fi
 
