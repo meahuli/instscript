@@ -188,6 +188,14 @@ class BlobStore:
                 self._items.move_to_end(key)
             return item
 
+    def remove(self, key):
+        with self._lock:
+            item = self._items.pop(key, None)
+            if item is None:
+                return False
+            self._bytes -= len(item[0])
+            return True
+
     def listing(self):
         """Newest first. The store is the source of truth -- unlike prompt
         history, which keeps ids long after their bytes have been evicted."""
@@ -237,7 +245,14 @@ _GALLERY_HTML = """<!doctype html>
  #grid{display:grid;gap:12px;
        grid-template-columns:repeat(auto-fill,minmax(240px,1fr))}
  .card{background:#161616;border:1px solid #262626;border-radius:6px;
-       overflow:hidden;display:flex;flex-direction:column}
+       overflow:hidden;display:flex;flex-direction:column;position:relative}
+ .del{position:absolute;right:6px;top:6px;width:22px;height:22px;border-radius:4px;
+      background:rgba(0,0,0,.6);color:#bbb;border:1px solid #333;cursor:pointer;
+      font:13px/1 sans-serif;display:flex;align-items:center;justify-content:center;
+      padding:0;opacity:0;transition:opacity .12s}
+ .card:hover .del,.del:focus{opacity:1}
+ .del:hover{background:#5a2020;border-color:#7a3030;color:#fff}
+ @media (hover:none){.del{opacity:1}}
  .card img,.card video{width:100%;aspect-ratio:1;object-fit:contain;
                        background:#000;display:block}
  .row{display:flex;justify-content:space-between;align-items:center;
@@ -331,8 +346,26 @@ let listing = {items:[],bytes:0,max_bytes:0};
 let io = null;
 
 function revokeAll(){
-  for(const u of held.values()) URL.revokeObjectURL(u);
+  for(const h of held.values()) URL.revokeObjectURL(h.url);
   held.clear(); heldBytes = 0;
+}
+
+async function drop(it, card){
+  let r;
+  try{ r = await fetch(tok('delete?id='+encodeURIComponent(it.id)), {method:'POST'}); }
+  catch(e){ return; }
+  if(r.status === 403){ showLogin('session expired'); return; }
+  if(!r.ok && r.status !== 404) return;   // 404: already gone, so we are done
+
+  const h = held.get(it.id);
+  if(h){ URL.revokeObjectURL(h.url); heldBytes -= h.size; held.delete(it.id); }
+  card.remove();
+  listing.items = listing.items.filter(x => x.id !== it.id);
+  listing.bytes = Math.max(0, listing.bytes - it.bytes);
+  if(!listing.items.length)
+    document.getElementById('grid').innerHTML =
+      '<div class="empty">store is empty &mdash; queue a prompt</div>';
+  updateMeta();
 }
 
 function updateMeta(){
@@ -384,7 +417,7 @@ async function hydrate(card, it){
     const b = new Blob([await decryptBlob(await r.arrayBuffer(), it)], {type: it.type});
     if(!card.isConnected) return;
     const o = URL.createObjectURL(b);
-    held.set(it.id, o); heldBytes += b.size;
+    held.set(it.id, {url:o, size:b.size}); heldBytes += b.size;
     const m = card.querySelector('img,video'); if(m) m.src = o;
     const a = card.querySelector('a');         if(a) a.href = o;
     updateMeta();
@@ -453,7 +486,16 @@ async function load(){
     a.textContent = 'save';
     row.append(span, a);
 
-    card.append(media, row);
+    // Deliberately in the far corner rather than beside "save" -- one is
+    // irreversible and the store is the only copy.
+    const del = document.createElement('button');
+    del.className = 'del';
+    del.type = 'button';
+    del.title = 'delete this preview';
+    del.textContent = '\\u00d7';
+    del.onclick = () => drop(it, card);
+
+    card.append(media, row, del);
     grid.appendChild(card);
     owner.set(card, it);
     if(viaJs) io.observe(card);
@@ -604,6 +646,17 @@ async def _inline_preview_stats(request):
     if deny is not None:
         return deny
     return web.json_response(STORE.stats())
+
+
+@PromptServer.instance.routes.post("/inline_preview/delete")
+async def _inline_preview_delete(request):
+    deny = _guard(request)
+    if deny is not None:
+        return deny
+    gone = STORE.remove(request.rel_url.query.get("id", ""))
+    # 404 means someone else got there first, or the LRU already evicted it --
+    # either way the caller's intent is satisfied, so the page treats it as done.
+    return web.json_response(dict(STORE.stats(), ok=gone), status=200 if gone else 404)
 
 
 @PromptServer.instance.routes.post("/inline_preview/clear")
