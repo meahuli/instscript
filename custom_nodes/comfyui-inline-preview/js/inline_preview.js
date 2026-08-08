@@ -211,6 +211,97 @@ function render(node, items) {
   }
 }
 
+// ---------------------------------------------------------------- uploads --
+
+const INPUT_NODE = "LoadImageInline";
+
+function inputURL(id) {
+  return api.apiURL(`/inline_input?id=${encodeURIComponent(id)}`);
+}
+
+async function upload(node, file, ui) {
+  if (!file) return;
+  ui.status.textContent = `uploading ${file.name}…`;
+  let r, d = {};
+  try {
+    r = await fetch(api.apiURL("/inline_input"), {
+      method: "POST",
+      headers: { "Content-Type": file.type || "application/octet-stream" },
+      body: file,
+    });
+    d = await r.json().catch(() => ({}));
+  } catch (e) {
+    ui.status.textContent = "upload failed: could not reach ComfyUI";
+    return;
+  }
+  if (!r.ok) {
+    ui.status.textContent =
+      r.status === 403 ? "locked — unlock the gallery once in this browser"
+    : d.reason === "too-large"   ? "too large for the RAM store"
+    : d.reason === "not-an-image" ? "that is not an image"
+    : `upload failed (HTTP ${r.status})`;
+    return;
+  }
+  const w = node.widgets?.find(x => x.name === "image_id");
+  if (w) w.value = d.id;
+  show(node, ui, d.id, `${file.name} · ${human(d.bytes)} · held in RAM`);
+}
+
+function show(node, ui, id, label) {
+  if (!id) { ui.img.style.display = "none"; ui.status.textContent = "no image"; return; }
+  ui.img.onerror = () => {
+    ui.img.style.display = "none";
+    ui.status.textContent = "gone from RAM — re-upload";
+  };
+  ui.img.onload = () => { ui.img.style.display = "block"; };
+  ui.img.src = inputURL(id);
+  if (label) ui.status.textContent = label;
+}
+
+function buildUploader(node) {
+  const el = container();
+  el.style.justifyContent = "flex-start";
+
+  const img = document.createElement("img");
+  img.style.cssText = "max-width:100%;max-height:180px;object-fit:contain;"
+                    + "border-radius:3px;display:none";
+
+  const status = document.createElement("div");
+  status.style.cssText = "color:#888;font:11px sans-serif;text-align:center";
+  status.textContent = "no image";
+
+  const pick = document.createElement("input");
+  pick.type = "file";
+  pick.accept = "image/*";
+  pick.style.display = "none";
+
+  const btn = document.createElement("button");
+  btn.textContent = "upload — or drop / paste";
+  btn.style.cssText = "background:#1e1e1e;color:#ddd;border:1px solid #333;"
+                    + "border-radius:4px;padding:5px 11px;font:11px sans-serif;cursor:pointer";
+
+  const ui = { img, status };
+  btn.onclick = () => pick.click();
+  pick.onchange = () => { upload(node, pick.files?.[0], ui); pick.value = ""; };
+
+  el.addEventListener("dragover", e => { e.preventDefault(); el.style.outline = "1px dashed #567"; });
+  el.addEventListener("dragleave", () => { el.style.outline = "none"; });
+  el.addEventListener("drop", e => {
+    e.preventDefault(); e.stopPropagation();
+    el.style.outline = "none";
+    upload(node, e.dataTransfer?.files?.[0], ui);
+  });
+  el.addEventListener("paste", e => {
+    const f = [...(e.clipboardData?.items || [])]
+      .find(i => i.type.startsWith("image/"))?.getAsFile();
+    if (f) { e.preventDefault(); upload(node, f, ui); }
+  });
+  el.tabIndex = 0;   // so the element can receive paste
+
+  el.append(img, status, btn, pick);
+  return { el, ui };
+}
+
 app.registerExtension({
   name: "inline.preview.ram",
 
@@ -220,6 +311,29 @@ app.registerExtension({
   },
 
   async beforeRegisterNodeDef(nodeType, nodeData) {
+    if (nodeData.name === INPUT_NODE) {
+      const onNodeCreated = nodeType.prototype.onNodeCreated;
+      nodeType.prototype.onNodeCreated = function () {
+        const r = onNodeCreated?.apply(this, arguments);
+        const { el, ui } = buildUploader(this);
+        this._inlineUploadUi = ui;
+        this.addDOMWidget("inline_upload", "upload", el, { serialize: false });
+        this.size = [Math.max(this.size[0], 260), Math.max(this.size[1], 300)];
+        return r;
+      };
+
+      // A restored workflow still carries the id, but the bytes are long gone if
+      // ComfyUI restarted -- show that rather than a broken image.
+      const onConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function () {
+        const r = onConfigure?.apply(this, arguments);
+        const id = this.widgets?.find(x => x.name === "image_id")?.value;
+        if (id && this._inlineUploadUi) show(this, this._inlineUploadUi, id, "restored from workflow");
+        return r;
+      };
+      return;
+    }
+
     if (!NODES.has(nodeData.name)) return;
 
     const onNodeCreated = nodeType.prototype.onNodeCreated;

@@ -37,7 +37,7 @@ from fractions import Fraction
 from collections import OrderedDict
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 from aiohttp import web
 from server import PromptServer
 
@@ -153,6 +153,57 @@ def _key_sweeper():
             pass
 
 
+class LoadImageInline:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image_id": ("STRING", {"default": "", "multiline": False,
+                                        "tooltip": "Filled in by the upload button. "
+                                                   "Points at bytes held in RAM."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("image", "mask")
+    FUNCTION = "load"
+    CATEGORY = "image"
+    DESCRIPTION = ("Load an image the browser uploaded straight into RAM. Nothing is "
+                   "written to the input directory, so it is not served by /view and "
+                   "its name never appears in /object_info.")
+
+    @classmethod
+    def IS_CHANGED(cls, image_id="", **kwargs):
+        # The id identifies the bytes, so this is a correct cache key -- unlike the
+        # preview nodes, which must re-run every time.
+        return image_id
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, image_id=""):
+        return True if image_id else "LoadImageInline: no image uploaded yet."
+
+    def load(self, image_id=""):
+        import torch
+
+        item = INPUTS.get(image_id)
+        if item is None:
+            raise ValueError(
+                "LoadImageInline: that image is no longer in the RAM store. It is "
+                "held in memory only, so a ComfyUI restart or an eviction loses it "
+                "-- re-upload it on the node.")
+
+        img = ImageOps.exif_transpose(Image.open(io.BytesIO(item[0])))
+        arr = np.array(img.convert("RGB")).astype(np.float32) / 255.0
+        image = torch.from_numpy(arr)[None, ]
+
+        if "A" in img.getbands():
+            alpha = np.array(img.getchannel("A")).astype(np.float32) / 255.0
+            mask = 1.0 - torch.from_numpy(alpha)
+        else:
+            mask = torch.zeros((64, 64), dtype=torch.float32)
+        return (image, mask.unsqueeze(0))
+
+
 _warned = set()
 
 
@@ -262,6 +313,11 @@ class BlobStore:
 
 
 STORE = BlobStore(MAX_STORE_BYTES)
+
+# Uploads live here instead of the input directory. Kept separate from STORE so
+# a busy generation session cannot evict the image a workflow still depends on.
+INPUT_MAX_BYTES = int(os.environ.get("INLINE_INPUT_MAX_MB", "512")) * 1024 * 1024
+INPUTS = BlobStore(INPUT_MAX_BYTES)
 
 
 _GALLERY_HTML = """<!doctype html>
@@ -748,6 +804,49 @@ async def _inline_preview_clear(request):
     return web.json_response(STORE.stats())
 
 
+@PromptServer.instance.routes.post("/inline_input")
+async def _inline_input_put(request):
+    deny = _guard(request)
+    if deny is not None:
+        return deny
+
+    data = await request.read()
+    if not data:
+        return web.json_response({"ok": False, "reason": "empty"}, status=400)
+    if len(data) > INPUT_MAX_BYTES:
+        return web.json_response({"ok": False, "reason": "too-large"}, status=413)
+    try:
+        # verify() consumes the object, so load() re-opens from the bytes later.
+        Image.open(io.BytesIO(data)).verify()
+    except Exception:
+        return web.json_response({"ok": False, "reason": "not-an-image"}, status=415)
+
+    ctype = request.headers.get("Content-Type", "image/png").split(";")[0].strip()
+    return web.json_response({"ok": True, "id": INPUTS.put(data, ctype),
+                              "bytes": len(data)})
+
+
+@PromptServer.instance.routes.get("/inline_input")
+async def _inline_input_get(request):
+    deny = _guard(request)
+    if deny is not None:
+        return deny
+    item = INPUTS.get(request.rel_url.query.get("id", ""))
+    if item is None:
+        return web.Response(status=404, text="expired: evicted from the RAM store")
+    return web.Response(body=item[0], content_type=item[1],
+                        headers={"Cache-Control": "no-store"})
+
+
+@PromptServer.instance.routes.post("/inline_input/clear")
+async def _inline_input_clear(request):
+    deny = _guard(request)
+    if deny is not None:
+        return deny
+    INPUTS.clear()
+    return web.json_response(INPUTS.stats())
+
+
 @PromptServer.instance.routes.get("/inline_preview/gallery")
 async def _inline_preview_gallery(request):
     # The page itself carries no data -- it asks for the password and then
@@ -1090,11 +1189,13 @@ except Exception as e:
 NODE_CLASS_MAPPINGS = {
     "PreviewImageInline": PreviewImageInline,
     "PreviewVideoInline": PreviewVideoInline,
+    "LoadImageInline": LoadImageInline,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PreviewImageInline": "Preview Image (RAM, no file)",
     "PreviewVideoInline": "Preview Video (RAM, no file)",
+    "LoadImageInline": "Load Image (RAM, no file)",
 }
 
 WEB_DIRECTORY = "./js"
