@@ -42,10 +42,17 @@ async function kidOf(raw) {
   return [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
 }
 
+let lastPublish = 0;
+
 async function publishKey(force) {
   if (keyPublished && !force) return;
+  // status fires repeatedly; collapse bursts. The window is tiny next to a
+  // generation, so the post still lands long before the preview node runs.
+  const now = Date.now();
+  if (force && now - lastPublish < 3000) return;
   const raw = sessionKey();
   if (!raw) return;
+  lastPublish = now;
   try {
     const r = await fetch(api.apiURL("/inline_preview/key"), {
       method: "POST",
@@ -57,17 +64,21 @@ async function publishKey(force) {
   } catch (e) {}
 }
 
-// The server drops the key once the pod is idle, so re-establish it on the way
-// into every queue. Without this the first run after a lull stores plaintext.
-function hookQueue() {
-  const orig = api?.queuePrompt;
-  if (typeof orig !== "function" || orig._inlinePreviewHooked) return;
-  const patched = async function (...args) {
-    try { await publishKey(true); } catch (e) {}
-    return orig.apply(api, args);
-  };
-  patched._inlinePreviewHooked = true;
-  api.queuePrompt = patched;
+// The server drops the key once the pod is idle, so it has to be re-established
+// before the next run -- otherwise the first generation after a lull is stored
+// in plaintext. Patching api.queuePrompt does not survive frontend versions
+// (it silently stopped firing on 1.47), so drive this off ComfyUI's own socket
+// events instead: they are broadcast to every connected tab, fire whoever
+// queued the prompt including the API, and land at the START of a graph while
+// the preview node runs at the end.
+function armKey() {
+  if (typeof api?.addEventListener !== "function") {
+    console.warn("inline_preview: no api.addEventListener — previews may be unencrypted");
+    return;
+  }
+  for (const ev of ["execution_start", "promptQueued", "status"]) {
+    api.addEventListener(ev, () => publishKey(true));
+  }
 }
 
 async function decryptBlob(buf, item) {
@@ -204,7 +215,7 @@ app.registerExtension({
   name: "inline.preview.ram",
 
   async setup() {
-    hookQueue();
+    armKey();
     publishKey();
   },
 
