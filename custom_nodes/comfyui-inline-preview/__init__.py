@@ -61,7 +61,7 @@ TOKEN = secrets.token_urlsafe(16) if _env_token is None else _env_token
 
 ALLOWED_ORIGIN = os.environ.get("INLINE_PREVIEW_ALLOW_ORIGIN", "")
 
-COOKIE = "inline_preview_session"
+COOKIE = "inline_preview_auth"
 COOKIE_MAX_AGE = 12 * 3600
 _SESSION = secrets.token_urlsafe(24)
 _fails = 0
@@ -627,10 +627,16 @@ async def _inline_preview_login(request):
 
 
 def _with_cookie(resp):
-    # Path-scoped so it never rides along with the rest of ComfyUI's routes;
-    # SameSite=Strict keeps it off cross-site requests even before _same_origin.
+    # path="/" is deliberate, not laziness. ComfyUI mirrors every route under
+    # /api, and the node widget reaches us through api.apiURL(), so it requests
+    # /api/inline_preview... . A cookie scoped to /inline_preview is simply not
+    # sent there, which left the in-canvas previews permanently "locked" while
+    # the gallery -- relative URLs under /inline_preview/ -- worked fine.
+    # SameSite=Strict plus the origin check are what actually contain this; the
+    # path never was. The value is an opaque per-boot token, meaningless to any
+    # other handler it now rides along with.
     resp.set_cookie(COOKIE, _SESSION, httponly=True, samesite="Strict",
-                    path="/inline_preview", max_age=COOKIE_MAX_AGE)
+                    path="/", max_age=COOKIE_MAX_AGE)
     return resp
 
 
