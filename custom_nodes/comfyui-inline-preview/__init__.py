@@ -92,16 +92,34 @@ def forget_key(why):
         log.info("inline_preview: session key forgotten (%s)", why)
 
 
+def _queue_busy():
+    """The preview node encrypts at the very end of a graph, so a generation
+    longer than the TTL would otherwise find the key already scrubbed and store
+    plaintext. While ComfyUI still has work in flight, the pod is not idle."""
+    try:
+        return PromptServer.instance.prompt_queue.get_tasks_remaining() > 0
+    except Exception:
+        return True   # unsure -> keep the key rather than silently drop to plaintext
+
+
 def _live_key():
-    """None once the TTL lapses, so a pod nobody is using holds no key at all."""
+    """None once the pod has been idle past the TTL, so a pod nobody is using
+    holds no key at all."""
     with _key_lock:
         if _session_key is None:
             return None
-        if KEY_TTL and time.time() - _key_touched > KEY_TTL:
-            _zero_locked()
-        else:
-            return bytes(_session_key), _session_kid
-    log.info("inline_preview: session key expired after %ds idle", KEY_TTL)
+        live = (bytes(_session_key), _session_kid)
+        stale = bool(KEY_TTL) and time.time() - _key_touched > KEY_TTL
+    if not stale:
+        return live
+    # Lock released before touching the queue -- never hold two at once.
+    if _queue_busy():
+        return live
+    with _key_lock:
+        if _session_key is None:
+            return None
+        _zero_locked()
+    log.info("inline_preview: session key scrubbed after %ds idle", KEY_TTL)
     return None
 
 
@@ -408,7 +426,8 @@ async function load(){
     const row = document.createElement('div');
     row.className = 'row';
     const span = document.createElement('span');
-    span.textContent = human(it.bytes)+' \\u00b7 '+ago(it.age);
+    span.textContent = human(it.bytes)+' \\u00b7 '+ago(it.age)
+      + (it.kid ? '' : ' \\u00b7 plain');
     const a = document.createElement('a');
     a.href = url;
     a.download = 'preview-'+it.id.slice(0,8)+(EXT[it.type]||'');
