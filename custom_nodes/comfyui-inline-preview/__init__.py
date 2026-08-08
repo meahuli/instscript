@@ -452,7 +452,11 @@ const tok = p => TOK ? p+(p.includes('?')?'&':'?')+'t='+encodeURIComponent(TOK) 
 const KEY_ITEM = 'inline_preview_session_key';
 const b64 = b => btoa(String.fromCharCode(...new Uint8Array(b)));
 const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
-let keyBytes = null, keyPublished = false;
+// This page decrypts, it never publishes. The server holds ONE key, so a
+// gallery open in a different browser -- or a normal window while ComfyUI runs
+// in incognito -- would otherwise post its own key, take the slot, and leave
+// the tab that is actually generating unable to read its own previews.
+let keyBytes = null;
 
 function sessionKey(){
   if(keyBytes) return keyBytes;
@@ -467,17 +471,6 @@ function sessionKey(){
 async function kidOf(raw){
   const h = await crypto.subtle.digest('SHA-256', raw);
   return [...new Uint8Array(h)].map(b=>b.toString(16).padStart(2,'0')).join('').slice(0,16);
-}
-
-async function publishKey(){
-  if(keyPublished) return;
-  const raw = sessionKey();
-  if(!raw) return;
-  try{
-    const r = await fetch(tok('key'), {method:'POST',
-      headers:{'Content-Type':'application/json'}, body: JSON.stringify({key: b64(raw)})});
-    keyPublished = r.ok;
-  }catch(e){}
 }
 
 async function decryptBlob(buf, it){
@@ -618,7 +611,6 @@ async function load(){
   catch(e){ grid.innerHTML='<div class="empty">could not reach ComfyUI</div>'; return; }
   if(r.status === 403){ showLogin(''); return; }
   setLocked(false);
-  publishKey();
   try { listing = await r.json(); }
   catch(e){ grid.innerHTML='<div class="empty">could not read the listing</div>'; return; }
 

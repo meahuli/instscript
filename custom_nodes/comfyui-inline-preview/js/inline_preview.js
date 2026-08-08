@@ -141,6 +141,9 @@ async function hydrate(node, item, wrap) {
     const buf = await decryptBlob(await r.arrayBuffer(), item);
     obj = URL.createObjectURL(new Blob([buf], { type: item.type }));
   } catch (e) {
+    // Something else took the server's single key slot. Claim it back so the
+    // next generation is readable here, rather than failing the same way again.
+    if (e.message === "otherkey") publishKey(true);
     note(wrap, MSG[e.message] || `could not load preview (${e.message})`, "#c88");
     return;
   }
