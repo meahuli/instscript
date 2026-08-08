@@ -219,16 +219,33 @@ function inputURL(id) {
   return api.apiURL(`/inline_input?id=${encodeURIComponent(id)}`);
 }
 
+// Encrypt before the bytes ever leave the tab, so the plaintext image is never
+// in the server's memory except while a graph is actually decoding it.
+async function sealForUpload(file) {
+  const buf = await file.arrayBuffer();
+  const raw = sessionKey();
+  if (!raw) return { body: buf, kid: "" };
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ck = await crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt"]);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, ck, buf));
+  const out = new Uint8Array(iv.length + ct.length);
+  out.set(iv, 0);
+  out.set(ct, iv.length);
+  return { body: out, kid: await kidOf(raw) };
+}
+
 async function upload(node, file, ui) {
   if (!file) return;
   ui.status.textContent = `uploading ${file.name}…`;
   let r, d = {};
   try {
-    r = await fetch(api.apiURL("/inline_input"), {
-      method: "POST",
-      headers: { "Content-Type": file.type || "application/octet-stream" },
-      body: file,
-    });
+    const { body, kid } = await sealForUpload(file);
+    const headers = { "Content-Type": file.type || "application/octet-stream" };
+    if (kid) {
+      headers["X-Inline-Kid"] = kid;
+      headers["X-Inline-Type"] = file.type || "image/png";
+    }
+    r = await fetch(api.apiURL("/inline_input"), { method: "POST", headers, body });
     d = await r.json().catch(() => ({}));
   } catch (e) {
     ui.status.textContent = "upload failed: could not reach ComfyUI";
@@ -244,17 +261,40 @@ async function upload(node, file, ui) {
   }
   const w = node.widgets?.find(x => x.name === "image_id");
   if (w) w.value = d.id;
-  show(node, ui, d.id, `${file.name} · ${human(d.bytes)} · held in RAM`);
+  show(node, ui, d.id,
+       `${file.name} · ${human(d.bytes)} · ${d.kid ? "encrypted in RAM" : "in RAM (plain)"}`);
 }
 
-function show(node, ui, id, label) {
+// The thumbnail cannot be a plain <img src>: encrypted bytes have to come
+// through JS first, exactly like the gallery.
+async function show(node, ui, id, label) {
+  if (ui.url) { URL.revokeObjectURL(ui.url); ui.url = null; }
   if (!id) { ui.img.style.display = "none"; ui.status.textContent = "no image"; return; }
-  ui.img.onerror = () => {
+
+  let r;
+  try { r = await fetch(inputURL(id), { cache: "no-store" }); }
+  catch (e) { ui.status.textContent = "could not reach ComfyUI"; return; }
+  if (!r.ok) {
     ui.img.style.display = "none";
-    ui.status.textContent = "gone from RAM — re-upload";
-  };
-  ui.img.onload = () => { ui.img.style.display = "block"; };
-  ui.img.src = inputURL(id);
+    ui.status.textContent = r.status === 403 ? "locked — unlock the gallery first"
+                                             : "gone from RAM — re-upload";
+    return;
+  }
+
+  const kid = r.headers.get("X-Inline-Kid") || "";
+  let buf;
+  try { buf = await decryptBlob(await r.arrayBuffer(), { kid }); }
+  catch (e) {
+    ui.img.style.display = "none";
+    ui.status.textContent = e.message === "otherkey"
+      ? "encrypted with a key this browser no longer has — re-upload"
+      : "no decryption key in this browser";
+    return;
+  }
+
+  ui.url = URL.createObjectURL(new Blob([buf], { type: r.headers.get("Content-Type") }));
+  ui.img.src = ui.url;
+  ui.img.style.display = "block";
   if (label) ui.status.textContent = label;
 }
 

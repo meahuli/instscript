@@ -153,6 +153,31 @@ def _key_sweeper():
             pass
 
 
+def _decrypt_input(blob, kid):
+    """Inputs must come back in the clear HERE, not in the browser, because the
+    graph needs a tensor. The browser re-posts its key on execution_start and
+    _queue_busy() holds it for the run, so the key is present exactly when this
+    needs it -- but say plainly what to do when it is not."""
+    if not kid:
+        return blob
+    live = _live_key()
+    if live is None:
+        raise ValueError(
+            "LoadImageInline: this image is encrypted and no session key is loaded. "
+            "Open ComfyUI in the browser that uploaded it and queue again -- it "
+            "hands the key over on every run.")
+    key, current = live
+    if current != kid:
+        raise ValueError(
+            "LoadImageInline: this image was encrypted with a different key (%s, "
+            "loaded %s). Whichever browser uploaded it must be the one that queues, "
+            "or re-upload it here." % (kid[:8], current[:8]))
+    try:
+        return AESGCM(key).decrypt(bytes(blob[:12]), bytes(blob[12:]), None)
+    except Exception as e:
+        raise ValueError("LoadImageInline: could not decrypt the stored image (%s)." % e)
+
+
 class LoadImageInline:
     @classmethod
     def INPUT_TYPES(cls):
@@ -192,7 +217,12 @@ class LoadImageInline:
                 "held in memory only, so a ComfyUI restart or an eviction loses it "
                 "-- re-upload it on the node.")
 
-        img = ImageOps.exif_transpose(Image.open(io.BytesIO(item[0])))
+        data = _decrypt_input(item[0], item[4])
+        try:
+            img = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+        except Exception as e:
+            raise ValueError("LoadImageInline: the stored bytes are not a readable "
+                             "image (%s)." % e)
         arr = np.array(img.convert("RGB")).astype(np.float32) / 255.0
         image = torch.from_numpy(arr)[None, ]
 
@@ -815,15 +845,22 @@ async def _inline_input_put(request):
         return web.json_response({"ok": False, "reason": "empty"}, status=400)
     if len(data) > INPUT_MAX_BYTES:
         return web.json_response({"ok": False, "reason": "too-large"}, status=413)
-    try:
-        # verify() consumes the object, so load() re-opens from the bytes later.
-        Image.open(io.BytesIO(data)).verify()
-    except Exception:
-        return web.json_response({"ok": False, "reason": "not-an-image"}, status=415)
 
-    ctype = request.headers.get("Content-Type", "image/png").split(";")[0].strip()
-    return web.json_response({"ok": True, "id": INPUTS.put(data, ctype),
-                              "bytes": len(data)})
+    kid = request.headers.get("X-Inline-Kid", "")
+    if kid:
+        # Ciphertext: the server cannot tell whether this is an image until the
+        # graph runs and it holds the key. load() checks after decrypting.
+        ctype = request.headers.get("X-Inline-Type", "image/png").split(";")[0].strip()
+    else:
+        try:
+            # verify() consumes the object, so load() re-opens from the bytes.
+            Image.open(io.BytesIO(data)).verify()
+        except Exception:
+            return web.json_response({"ok": False, "reason": "not-an-image"}, status=415)
+        ctype = request.headers.get("Content-Type", "image/png").split(";")[0].strip()
+
+    return web.json_response({"ok": True, "id": INPUTS.put(data, ctype, False, kid),
+                              "bytes": len(data), "kid": kid})
 
 
 @PromptServer.instance.routes.get("/inline_input")
@@ -834,8 +871,10 @@ async def _inline_input_get(request):
     item = INPUTS.get(request.rel_url.query.get("id", ""))
     if item is None:
         return web.Response(status=404, text="expired: evicted from the RAM store")
+    # Served exactly as stored. If it is encrypted the browser decrypts it with
+    # the key it uploaded under -- the bytes never leave here in the clear.
     return web.Response(body=item[0], content_type=item[1],
-                        headers={"Cache-Control": "no-store"})
+                        headers={"Cache-Control": "no-store", "X-Inline-Kid": item[4]})
 
 
 @PromptServer.instance.routes.post("/inline_input/clear")
