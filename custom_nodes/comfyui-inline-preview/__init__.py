@@ -279,6 +279,8 @@ def _decrypt_input(blob, kid):
     displaces the one this upload needs; a miss now means that browser has not
     posted at all, not that it lost a race."""
     if not kid:
+        log.info("inline_preview: LoadImageInline read a PLAINTEXT upload -- it was "
+                 "stored without a key, so there is nothing to decrypt")
         return blob
     key = _await_key(kid, KEY_WAIT)
     if key is None:
@@ -288,7 +290,10 @@ def _decrypt_input(blob, kid):
             "again -- it posts its key on every run -- or re-upload the image here."
             % kid[:8])
     try:
-        return AESGCM(key).decrypt(bytes(blob[:12]), bytes(blob[12:]), None)
+        out = AESGCM(key).decrypt(bytes(blob[:12]), bytes(blob[12:]), None)
+        log.info("inline_preview: LoadImageInline decrypted an upload under key %s",
+                 kid[:8])
+        return out
     except Exception as e:
         raise ValueError("LoadImageInline: could not decrypt the stored image (%s)." % e)
 
@@ -1062,6 +1067,19 @@ async def _inline_input_put(request):
         ctype = request.headers.get("Content-Type", "image/png").split(";")[0].strip()
 
     name = unquote(request.headers.get("X-Inline-Name", ""))[:120]
+
+    # Uploads are user-driven and rare, so one line each is worth it -- and the
+    # unencrypted case was previously as silent here as it was for previews.
+    if kid:
+        log.info("inline_preview: upload %r (%d bytes) held SEALED under key %s",
+                 name or "image", len(data), kid[:8])
+    else:
+        log.warning("inline_preview: upload %r (%d bytes) held UNENCRYPTED -- the browser "
+                    "sent no key with it (the password still gates it). That needs a secure "
+                    "context: https, or localhost via a tunnel. Over plain http to an IP "
+                    "crypto.subtle does not exist and nothing can be encrypted.",
+                    name or "image", len(data))
+
     return web.json_response({"ok": True, "kid": kid, "bytes": len(data),
                               "id": INPUTS.put(data, ctype, False, kid, name)})
 
