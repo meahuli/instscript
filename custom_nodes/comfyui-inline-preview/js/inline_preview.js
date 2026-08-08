@@ -89,7 +89,12 @@ function keyPair() {
     try {
       const db = await idb();
       const made = await crypto.subtle.generateKey(
-        { name: "RSA-OAEP", modulusLength: 2048, hash: "SHA-256" },
+        // publicExponent is REQUIRED and must be a Uint8Array -- WebCrypto has no
+        // default for it. Omitting it throws OperationError before any key
+        // exists, which read as "this browser cannot do it" rather than as a
+        // typo. 0x010001 = 65537, big-endian.
+        { name: "RSA-OAEP", modulusLength: 2048,
+          publicExponent: new Uint8Array([0x01, 0x00, 0x01]), hash: "SHA-256" },
         false,
         ["encrypt", "decrypt"]);
       return await idbClaim(db, made);
