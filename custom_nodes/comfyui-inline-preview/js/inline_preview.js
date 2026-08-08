@@ -117,6 +117,12 @@ function human(bytes) {
   return `${n.toFixed(n < 10 && i > 0 ? 1 : 0)} ${u[i]}`;
 }
 
+function ago(s) {
+  return s < 60 ? `${Math.round(s)}s ago`
+       : s < 3600 ? `${Math.round(s / 60)}m ago`
+       : `${(s / 3600).toFixed(1)}h ago`;
+}
+
 function revokeAll(node) {
   for (const u of node._inlineObjectUrls || []) URL.revokeObjectURL(u);
   node._inlineObjectUrls = [];
