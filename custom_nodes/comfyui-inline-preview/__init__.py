@@ -46,6 +46,17 @@ log = logging.getLogger("inline_preview")
 MAX_STORE_BYTES = int(os.environ.get("INLINE_PREVIEW_MAX_MB", "2048")) * 1024 * 1024
 
 _env_token = os.environ.get("INLINE_PREVIEW_TOKEN")
+if _env_token is not None:
+    # Both of these present as "wrong password" and are invisible from the
+    # browser: template UIs leave trailing newlines, and a value typed with
+    # quotes arrives with the quotes as part of the string.
+    if _env_token != _env_token.strip():
+        log.warning("inline_preview: stripped surrounding whitespace from INLINE_PREVIEW_TOKEN")
+        _env_token = _env_token.strip()
+    if len(_env_token) > 1 and _env_token[0] == _env_token[-1] and _env_token[0] in "\"'":
+        log.warning("inline_preview: INLINE_PREVIEW_TOKEN begins and ends with %s -- those "
+                    "quotes ARE part of the password. Set it unquoted if that was not intended.",
+                    _env_token[0])
 TOKEN = secrets.token_urlsafe(16) if _env_token is None else _env_token
 
 ALLOWED_ORIGIN = os.environ.get("INLINE_PREVIEW_ALLOW_ORIGIN", "")
@@ -406,7 +417,19 @@ async function login(){
     r = await fetch('login', {method:'POST', headers:{'Content-Type':'application/json'},
                               body: JSON.stringify({password: pw.value})});
   }catch(e){ showLogin('could not reach ComfyUI'); return; }
-  if(!r.ok){ pw.select(); showLogin('wrong password'); return; }
+  if(!r.ok){
+    let d = {};
+    try{ d = await r.json(); }catch(e){}
+    pw.select();
+    showLogin(
+      d.reason === 'origin'    ? 'blocked: this request looked cross-origin'
+    : d.reason === 'no-crypto' ? 'server is missing the cryptography package'
+    : d.reason === 'password'  ? (d.from_env ? 'wrong password'
+                                  : 'wrong password \\u2014 INLINE_PREVIEW_TOKEN never '
+                                    + 'reached ComfyUI, so it wants the random one from the log')
+    : 'login failed (HTTP '+r.status+')');
+    return;
+  }
   pw.value = '';
   setLocked(false);
   load();
@@ -560,8 +583,10 @@ def _guard(request, need_token=True):
 @PromptServer.instance.routes.post("/inline_preview/login")
 async def _inline_preview_login(request):
     global _fails
+    # Distinct reasons: the page renders these, and "wrong password" for an
+    # origin refusal sends you hunting for the wrong problem.
     if not _same_origin(request):
-        return web.Response(status=403, text="cross-origin request refused")
+        return web.json_response({"ok": False, "reason": "origin"}, status=403)
     if not TOKEN:
         return web.json_response({"ok": True})
 
@@ -574,7 +599,8 @@ async def _inline_preview_login(request):
         _fails += 1
         # No rate limiter in front of this, so make guessing cost wall time.
         await asyncio.sleep(min(2.0, 0.25 * _fails))
-        return web.json_response({"ok": False}, status=403)
+        return web.json_response({"ok": False, "reason": "password",
+                                  "from_env": _env_token is not None}, status=403)
 
     _fails = 0
     return _with_cookie(web.json_response({"ok": True}))
