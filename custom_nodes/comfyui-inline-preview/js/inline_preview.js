@@ -261,15 +261,26 @@ async function upload(node, file, ui) {
   }
   const w = node.widgets?.find(x => x.name === "image_id");
   if (w) w.value = d.id;
+  // Draw from the local File. Re-fetching what we just sent would double the
+  // traffic over the tunnel, which is the slow part of this whole operation.
   show(node, ui, d.id,
-       `${file.name} · ${human(d.bytes)} · ${d.kid ? "encrypted in RAM" : "in RAM (plain)"}`);
+       `${file.name} · ${human(d.bytes)} · ${d.kid ? "encrypted in RAM" : "in RAM (plain)"}`,
+       file);
 }
 
 // The thumbnail cannot be a plain <img src>: encrypted bytes have to come
 // through JS first, exactly like the gallery.
-async function show(node, ui, id, label) {
+async function show(node, ui, id, label, localFile) {
   if (ui.url) { URL.revokeObjectURL(ui.url); ui.url = null; }
   if (!id) { ui.img.style.display = "none"; ui.status.textContent = "no image"; return; }
+
+  if (localFile) {
+    ui.url = URL.createObjectURL(localFile);
+    ui.img.src = ui.url;
+    ui.img.style.display = "block";
+    if (label) ui.status.textContent = label;
+    return;
+  }
 
   let r;
   try { r = await fetch(inputURL(id), { cache: "no-store" }); }
