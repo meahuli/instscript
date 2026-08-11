@@ -125,12 +125,7 @@ NODES=(
   "https://github.com/ClownsharkBatwing/RES4LYF@26036f647ca15d3048a193daf99a40cecfc3820d"
   # main   2026-06-29
   "https://github.com/MadiatorLabs/ComfyUI-RunpodDirect@809065c9d2f3874dc215106784af49f3f0cb368f"
-  # main   2026-08-09  MiniMax-H3 prompt enhancer: the only nodes that can load the
-  # layers 50-63 generation tail (dl-minimax-h3.sh WITH_TAIL=1). Repo was 6 days old
-  # at this pin, so treat a sha bump as a re-review, not a formality. Reviewed at this
-  # sha: no outbound network calls, no subprocess/eval/pickle, no third-party deps, no
-  # credential reads. It does register two token-guarded POST routes on ComfyUI's own
-  # server (/minimax_h3/prompt_review/{recover,decision}) for the Plan v2 review gate.
+  # main   2026-08-09
   "https://github.com/ethanfel/ComfyUI-MiniMax-H3-Guide@ae0789c2423dd72c4ad50ac2da10535882e87713"
 )
 

@@ -6,14 +6,14 @@
   "nodes": [
     {
       "id": 92,
-      "type": "SaveVideo",
+      "type": "PreviewVideoInline",
       "pos": [
         -210,
         4850
       ],
       "size": [
-        1030,
-        106
+        640,
+        380
       ],
       "flags": {},
       "order": 6,
@@ -24,48 +24,15 @@
           "name": "video",
           "type": "VIDEO",
           "link": 194
-        },
-        {
-          "localized_name": "文件名前缀",
-          "name": "filename_prefix",
-          "type": "STRING",
-          "widget": {
-            "name": "filename_prefix"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "格式",
-          "name": "format",
-          "type": "COMBO",
-          "widget": {
-            "name": "format"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "编码器",
-          "name": "codec",
-          "type": "COMFY_DYNAMICCOMBO_V3",
-          "widget": {
-            "name": "codec"
-          },
-          "link": null
         }
       ],
-      "outputs": [
-        {
-          "localized_name": "video",
-          "name": "video",
-          "type": "VIDEO",
-          "links": null
-        }
-      ],
-      "properties": {},
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewVideoInline"
+      },
       "widgets_values": [
-        "video/MiniMax_H3",
-        "auto",
-        "auto"
+        0,
+        85
       ]
     },
     {
@@ -186,42 +153,23 @@
     },
     {
       "id": 114,
-      "type": "LoadImage",
+      "type": "LoadImageInline",
       "pos": [
         -1610,
         4860
       ],
       "size": [
-        450,
-        630
+        400,
+        120
       ],
       "flags": {},
       "order": 1,
       "mode": 0,
-      "inputs": [
-        {
-          "localized_name": "图像",
-          "name": "image",
-          "type": "COMBO",
-          "widget": {
-            "name": "image"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "选择文件上传",
-          "name": "upload",
-          "type": "IMAGEUPLOAD",
-          "widget": {
-            "name": "upload"
-          },
-          "link": null
-        }
-      ],
+      "inputs": [],
       "outputs": [
         {
           "localized_name": "图像",
-          "name": "IMAGE",
+          "name": "image",
           "type": "IMAGE",
           "links": [
             218
@@ -229,17 +177,16 @@
         },
         {
           "localized_name": "遮罩",
-          "name": "MASK",
+          "name": "mask",
           "type": "MASK",
           "links": null
         }
       ],
       "properties": {
-        "Node name for S&R": "LoadImage"
+        "Node name for S&R": "LoadImageInline"
       },
       "widgets_values": [
-        "HOyOrBHXAAAofrW.jpg",
-        "image"
+        ""
       ]
     },
     {
@@ -439,30 +386,6 @@
         0.4,
         32
       ]
-    },
-    {
-      "id": 118,
-      "type": "MarkdownNote",
-      "pos": [
-        -1130,
-        5460
-      ],
-      "size": [
-        300,
-        520
-      ],
-      "flags": {},
-      "order": 3,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "Note: Size Settings Reference",
-      "properties": {},
-      "widgets_values": [
-        "| megapixels | Aspect | Output (multiple=32) |\n|---|---|---|\n| 0.2 | 16:9 | 608 x 352 |\n| 0.3 | 16:9 | 736 x 416 |\n| 0.4 | 16:9 | 864 x 480 |\n| 0.5 | 16:9 | 960 x 544 |\n| 0.6 | 16:9 | 1056 x 608 |\n| 0.7 | 16:9 | 1152 x 640 |\n| 0.8 | 16:9 | 1216 x 672 |\n| 0.9 | 16:9 | 1280 x 736 |\n| 0.98 | 16:9 | 1344 x 768 |\n| 1.0 | 16:9 | 1376 x 768 |\n| 1.2 | 16:9 | 1504 x 832 |\n| 1.5 | 16:9 | 1664 x 928 |\n| 1.8 | 16:9 | 1824 x 1024 |\n| 2.0 | 16:9 | 1920 x 1088 |\n"
-      ],
-      "color": "#222",
-      "bgcolor": "#000"
     }
   ],
   "links": [
@@ -1233,7 +1156,14 @@
               }
             ],
             "properties": {
-              "Node name for S&R": "CLIPLoader", "models": [{"name": "qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors", "url": "https://huggingface.co/ethanfel/Qwen3-VL-32B-Ultra-Heretic-H3-ComfyUI-INT8-ConvRot/resolve/main/qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors", "directory": "text_encoders"}]
+              "Node name for S&R": "CLIPLoader",
+              "models": [
+                {
+                  "name": "qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors",
+                  "url": "https://huggingface.co/ethanfel/Qwen3-VL-32B-Ultra-Heretic-H3-ComfyUI-INT8-ConvRot/resolve/main/qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors",
+                  "directory": "text_encoders"
+                }
+              ]
             },
             "widgets_values": [
               "qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors",
@@ -1606,7 +1536,14 @@
               }
             ],
             "properties": {
-              "Node name for S&R": "MiniMaxH3GenerationTailLoader", "models": [{"name": "qwen3vl_32b_h3_generation_tail_50_63_int8_convrot.safetensors", "url": "https://huggingface.co/ethanfel/Qwen3-VL-32B-Ultra-Heretic-H3-ComfyUI-INT8-ConvRot/resolve/main/qwen3vl_32b_h3_generation_tail_50_63_int8_convrot.safetensors", "directory": "text_encoders"}]
+              "Node name for S&R": "MiniMaxH3GenerationTailLoader",
+              "models": [
+                {
+                  "name": "qwen3vl_32b_h3_generation_tail_50_63_int8_convrot.safetensors",
+                  "url": "https://huggingface.co/ethanfel/Qwen3-VL-32B-Ultra-Heretic-H3-ComfyUI-INT8-ConvRot/resolve/main/qwen3vl_32b_h3_generation_tail_50_63_int8_convrot.safetensors",
+                  "directory": "text_encoders"
+                }
+              ]
             },
             "widgets_values": [
               "qwen3vl_32b_h3_generation_tail_50_63_int8_convrot.safetensors"
