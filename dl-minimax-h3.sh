@@ -7,13 +7,13 @@ PRUNED="${PRUNED:-1}"
 ENCODER="${ENCODER:-uncensored}"
 WITH_TAIL="${WITH_TAIL:-1}"
 
-case "$MODELS_SEL" in fl2va|ref2va) ;; *) echo "ERROR: MODELS must be fl2va or ref2va, one per run (got '$MODELS_SEL')" >&2; exit 1 ;; esac
+case "$MODELS_SEL" in fl2va|ref2va|pinkcherry) ;; *) echo "ERROR: MODELS must be fl2va, ref2va, or pinkcherry, one per run (got '$MODELS_SEL')" >&2; exit 1 ;; esac
 case "$PRUNED"    in 0|1) ;;           *) echo "ERROR: PRUNED must be 0 or 1 (got '$PRUNED')" >&2; exit 1 ;; esac
 case "$WITH_TAIL" in 0|1) ;;           *) echo "ERROR: WITH_TAIL must be 0 or 1 (got '$WITH_TAIL')" >&2; exit 1 ;; esac
-[ "$MODELS_SEL" = "fl2va" ] && OTHER="ref2va" || OTHER="fl2va"
 
 MM="https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main"
 EF="https://huggingface.co/ethanfel/Qwen3-VL-32B-Ultra-Heretic-H3-ComfyUI-INT8-ConvRot/resolve/main"
+PC="https://huggingface.co/SexGod1979/PinkCherry-NSFW_MiniMax-H3/resolve/main"
 WFBASE="https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates"
 WF_DIR="$COMFY/user/default/workflows"
 TAIL_FILE="qwen3vl_32b_h3_generation_tail_50_63_int8_convrot.safetensors"
@@ -23,6 +23,24 @@ ENH_NAME="video_minimax_h3_i2v_enhancer.json"
 
 if [ "$PRUNED" = "1" ]; then VARIANT="pruned_int8_convrot"; else VARIANT="int8_convrot"; fi
 
+case "$MODELS_SEL" in
+  fl2va|ref2va)
+    MODEL_KIND="$MODELS_SEL"
+    CHECKPOINT_FILE="minimax_h3_${MODEL_KIND}_${VARIANT}.safetensors"
+    CHECKPOINT_URL="$MM/diffusion_models/$CHECKPOINT_FILE"
+    [ "$PRUNED" = "1" ] && CHECKPOINT_GB=21 || CHECKPOINT_GB=34
+    [ "$MODEL_KIND" = "fl2va" ] && OTHER="ref2va" || OTHER="fl2va"
+    ;;
+  pinkcherry)
+    MODEL_KIND="ref2va"
+    CHECKPOINT_FILE="pinkcherrry_minimax_h3_ref2va_beta-0.6_int8_convrot.safetensors"
+    CHECKPOINT_URL="$PC/ref2va-beta-06/$CHECKPOINT_FILE"
+    CHECKPOINT_GB=21
+    OTHER="fl2va"
+    [ "$PRUNED" = "0" ] && echo "==> PRUNED=0 ignored: the PinkCherry checkpoint has one int8_convrot variant"
+    ;;
+esac
+
 case "$ENCODER" in
   uncensored) ENC_FILE="qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors"
               ENC_URL="$EF/$ENC_FILE" ;;
@@ -31,8 +49,7 @@ case "$ENCODER" in
   *) echo "ERROR: ENCODER must be uncensored or stock (got '$ENCODER')" >&2; exit 1 ;;
 esac
 
-NEED=$([ "$PRUNED" = "1" ] && echo 21 || echo 34)
-NEED=$((NEED + 27 + 6))
+NEED=$((CHECKPOINT_GB + 27 + 6))
 [ "$WITH_TAIL" = "1" ] && NEED=$((NEED + 8))
 FREE=$(df -BG --output=avail "$MODELS_DIR" 2>/dev/null | tail -n1 | tr -dc '0-9')
 echo "==> $MODELS_SEL selected; ~${NEED} GB to download; ${FREE:-?} GB free on $MODELS_DIR"
@@ -46,7 +63,7 @@ if [ -n "$OTHER_ON_DISK" ]; then
   printf '      rm %s\n' $OTHER_ON_DISK
 fi
 
-get "$MM/diffusion_models/minimax_h3_${MODELS_SEL}_${VARIANT}.safetensors" diffusion_models "minimax_h3_${MODELS_SEL}_${VARIANT}.safetensors"
+get "$CHECKPOINT_URL" diffusion_models "$CHECKPOINT_FILE"
 
 get "$ENC_URL" text_encoders "$ENC_FILE"
 
@@ -59,13 +76,13 @@ fi
 get "$MM/vae/minimax_h3_video_vae_fp16.safetensors" vae minimax_h3_video_vae_fp16.safetensors
 get "$MM/vae/minimax_h3_audio_vae_fp32.safetensors" vae minimax_h3_audio_vae_fp32.safetensors
 
-case "$MODELS_SEL" in
+case "$MODEL_KIND" in
   fl2va)  WFS="video_minimax_h3_t2v.json video_minimax_h3_i2v.json" ;;
   ref2va) WFS="video_minimax_h3_r2v.json" ;;
 esac
-[ "$WITH_TAIL" = "1" ] && [ "$MODELS_SEL" = "fl2va" ] && WFS="$WFS $ENH_NAME"
-[ "$WITH_TAIL" = "1" ] && [ "$MODELS_SEL" = "ref2va" ] && \
-  echo "==> no enhancer workflow: it is an fl2va graph and MODELS=ref2va"
+[ "$WITH_TAIL" = "1" ] && [ "$MODEL_KIND" = "fl2va" ] && WFS="$WFS $ENH_NAME"
+[ "$WITH_TAIL" = "1" ] && [ "$MODEL_KIND" = "ref2va" ] && \
+  echo "==> no enhancer workflow: it is an fl2va graph and MODELS=$MODELS_SEL"
 
 deploy_local() {
   [ -f "$SELF_DIR/$1" ] || return 1
@@ -92,7 +109,9 @@ for WF_NAME in $WFS; do
   sed -i "s|qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot\.safetensors|$ENC_FILE|g" "$WF"
   sed -i "s|$MM/text_encoders/$ENC_FILE|$ENC_URL|g" "$WF"
   sed -i "s|$EF/$ENC_FILE|$ENC_URL|g" "$WF"
-  [ "$PRUNED" = "0" ] && sed -i "s|_pruned_int8_convrot|_int8_convrot|g" "$WF"
+  DEFAULT_CHECKPOINT="minimax_h3_${MODEL_KIND}_pruned_int8_convrot.safetensors"
+  sed -i "s|$MM/diffusion_models/$DEFAULT_CHECKPOINT|$CHECKPOINT_URL|g" "$WF"
+  sed -i "s|$DEFAULT_CHECKPOINT|$CHECKPOINT_FILE|g" "$WF"
 
   if [ "$LOCAL" = "0" ] && [ "$WF_NAME" = "$ENH_NAME" ]; then
     sed -i "s|\"Node name for S&R\": \"CLIPLoader\"|\"Node name for S\\&R\": \"CLIPLoader\", \"models\": [{\"name\": \"$ENC_FILE\", \"url\": \"$ENC_URL\", \"directory\": \"text_encoders\"}]|" "$WF"
@@ -110,7 +129,7 @@ fi
 
 echo ""
 echo "MiniMax-H3 ready in $MODELS_DIR"
-echo "  checkpoint: minimax_h3_${MODELS_SEL}_${VARIANT}.safetensors"
+echo "  checkpoint: $CHECKPOINT_FILE"
 echo "  encoder:    $ENC_FILE"
 echo "  workflows:  $WF_DIR"
 echo "  to add $OTHER later:  MODELS=$OTHER bash $0"
